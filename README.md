@@ -52,9 +52,14 @@ Available architectures :
 
 | Classes   | Dataset   | Architecture  | Trainer   | Weights   |
 | :-------: | :-------: | :-----------: | :-------: | :-------: |
-| `en`      | `LibriSpeech` | `Jasper`      | [NVIDIA](https://github.com/NVIDIA)   | [Google Drive](https://drive.google.com/drive/folders/1mAUv_dKK50P0-ffYQgtEWnNc9gYk4ZwX?usp=sharing)  |
+| `en`      | `LibriSpeech` | `Jasper`  | [NVIDIA](https://github.com/NVIDIA)   | [Google Drive](https://drive.google.com/file/d/1JViFiy-JZ8VYTlaZPVDMZfg0qWcY5-U8/view?usp=sharing)\*  |
+| `fr`      | `SIWIS`, `VoxForge`, `Common Voice`   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1R9lXaEj4etAyyfy7r3tYNnO5FPwQ7RXS/view?usp=sharing)  |
+
+**Warning** : `Jasper` model weights are 3Go files !
 
 Models must be unzipped in the `pretrained_models/` directory !
+
+\* This file is a `.h5` weights file. You have to put it in `pretrained_models/pretrained_weights/` folder and call `Jasper.build_from_pretrained_jasper()` method to build the `Jasper` class with pretrained weights ! You can simply execute the cell in `example_training` notebook ;)
 
 ## Installation and usage
 

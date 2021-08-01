@@ -4,7 +4,7 @@ import tensorflow as tf
 from hparams.hparams import HParams
 from custom_layers import TokenEmbedding, PositionalEmbedding
 from utils.text.text_processing import create_look_ahead_mask
-from custom_architectures.transformer_arch import Transformer, HParamsTransformer
+from custom_architectures.transformers_arch.transformer_arch import Transformer, HParamsTransformer
 
 HParamsSpeechEmbedding  = HParams(
     num_layers  = 3,

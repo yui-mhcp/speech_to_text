@@ -5,35 +5,34 @@ from custom_layers import get_activation, MultiHeadAttention, HParamsMHA
 from hparams.hparams import HParams
 from utils.text.text_processing import create_look_ahead_mask
 
+_base_layer_kwargs    = {
+    'embedding_dim' : 512,
+    'epsilon'   : 1e-12,
+    'drop_rate' : 0.1,
+    'ffn_dim'   : 1024,
+    'ffn_activation'    : 'relu'
+}
+
+_base_enc_dec_kwargs    = {
+    'num_layers'    : 4,
+    'return_attention'  : True
+}
+
 HParamsTransformerEncoderLayer = HParams(
     ** HParamsMHA.get_config(add_prefix = 'mha'),
-
-    embedding_dim   = 512,
-    
-    epsilon = 1e-12,
-    drop_rate   = 0.1,
-    ffn_dim     = 1024,
-    ffn_activation  = "relu",
+    ** _base_layer_kwargs
 )
-HParamsTransformerEncoder = HParams(
-    ** HParamsTransformerEncoderLayer,
-    num_layers  = 4
-)
-
 HParamsTransformerDecoderLayer = HParams(
     ** HParamsMHA.get_config(add_prefix = 'mha'),
     ** HParamsMHA.get_config(add_prefix = 'enc_mha'),
-    
-    embedding_dim   = 512,
-    
-    epsilon = 1e-12,
-    drop_rate   = 0.1,
-    ffn_dim     = 1024,
-    ffn_activation  = "relu",
+    ** _base_layer_kwargs
 )
-HParamsTransformerDecoder = HParams(
-    ** HParamsTransformerDecoderLayer,
-    num_layers  = 4
+
+HParamsTransformerEncoder = HParamsTransformerEncoderLayer(
+    ** _base_enc_dec_kwargs
+)
+HParamsTransformerDecoder = HParamsTransformerDecoderLayer(
+    ** _base_enc_dec_kwargs
 )
 
 HParamsTransformer  = HParams(
@@ -41,22 +40,24 @@ HParamsTransformer  = HParams(
     ** HParamsTransformerDecoder.get_config(add_prefix = 'decoder')
 )
 
+def FeedForwardNetwork(ffn_dim, ffn_activation, embedding_dim):
+    act_layer = get_activation(ffn_activation)
+    
+    ffn = tf.keras.Sequential(name = "ffn")
+    ffn.add(tf.keras.layers.Dense(ffn_dim, name = 'ffn_dense_1'))
+    if act_layer is not None: ffn.add(act_layer)
+    ffn.add(tf.keras.layers.Dense(embedding_dim, name = 'ffn_dense_2'))
+    return ffn
 
 class TransformerEncoderLayer(tf.keras.layers.Layer):
     def __init__(self, embedding_dim, name = None, ** kwargs):
         super().__init__(name = name)
         self.hparams    = HParamsTransformerEncoderLayer.extract(kwargs)
-        self.hparams.embedding_dim      = embedding_dim
-        self.hparams.mha_attention_dim  = self.hparams.embedding_dim
-        
-        ffn_act = get_activation(self.hparams.ffn_activation) if self.hparams.ffn_activation is not None else None
+        self.hparams    = self.hparams(embedding_dim = embedding_dim, mha_attention_dim = embedding_dim)
         
         self.attention  = MultiHeadAttention(** self.hparams.get_config(prefix = 'mha'), name = 'mha')
         
-        self.ffn    = tf.keras.Sequential()
-        self.ffn.add(tf.keras.layers.Dense(self.hparams.ffn_dim, name = 'ffn_dense_1'))
-        if ffn_act is not None: self.ffn.add(ffn_act)
-        self.ffn.add(tf.keras.layers.Dense(self.hparams.embedding_dim, name = 'ffn_dense_2'))
+        self.ffn = FeedForwardNetwork(self.hparams.ffn_dim, self.hparams.ffn_activation, embedding_dim)
         
         self.norm   = tf.keras.layers.LayerNormalization(epsilon = self.hparams.epsilon)
         self.dropout    = tf.keras.layers.Dropout(self.hparams.drop_rate)
@@ -90,37 +91,32 @@ class TransformerEncoderLayer(tf.keras.layers.Layer):
     
     def get_config(self):
         config = super().get_config()
-        return self.hparams + config
+        return (self.hparams + config).get_config()
     
 class TransformerDecoderLayer(tf.keras.layers.Layer):
     def __init__(self, embedding_dim, name = None, ** kwargs):
         super().__init__(name = name)
         self.hparams    = HParamsTransformerDecoderLayer.extract(kwargs)
-        self.hparams.embedding_dim      = embedding_dim
-        self.hparams.mha_attention_dim  = self.hparams.embedding_dim
-        self.hparams.enc_mha_attention_dim  = self.hparams.embedding_dim
-        self.hparams.mha_normalize  = False
-        
-        ffn_act = get_activation(self.hparams.ffn_activation) if self.hparams.ffn_activation is not None else None
+        self.hparams    = self.hparams(
+            embedding_dim       = embedding_dim,
+            mha_attention_dim   = embedding_dim,
+            enc_mha_attention_dim   = embedding_dim
+        )
         
         self.attention  = MultiHeadAttention(** self.hparams.get_config(prefix = 'mha'), name = 'mha')
         self.enc_attention  = MultiHeadAttention(
             ** self.hparams.get_config(prefix = 'enc_mha'), name = 'enc_mha'
         )
         
-        self.ffn    = tf.keras.Sequential()
-        self.ffn.add(tf.keras.layers.Dense(self.hparams.ffn_dim, name = 'ffn_dense_1'))
-        if ffn_act is not None: self.ffn.add(ffn_act)
-        self.ffn.add(tf.keras.layers.Dense(self.hparams.embedding_dim, name = 'ffn_dense_2'))
+        self.ffn = FeedForwardNetwork(self.hparams.ffn_dim, self.hparams.ffn_activation, embedding_dim)
         
-        self.norm_1     = tf.keras.layers.LayerNormalization(epsilon = self.hparams.epsilon)
-        self.norm_2     = tf.keras.layers.LayerNormalization(epsilon = self.hparams.epsilon)
+        self.norm       = tf.keras.layers.LayerNormalization(epsilon = self.hparams.epsilon)
         self.dropout    = tf.keras.layers.Dropout(self.hparams.drop_rate)
     
     def call(self,
              inputs,
              training   = False,
-             padding_mask       = None,
+             enc_padding_mask   = None,
              look_ahead_mask    = None,
              return_attention   = True
             ):
@@ -129,7 +125,7 @@ class TransformerDecoderLayer(tf.keras.layers.Layer):
                 - inputs    : list of [encoder_output, decoder_input]
                     - encoder_output    : encoder output with shape [batch_size, seq_len_in, encoder_embedding_dim]
                     - decoder_input     : decoder input with shape [batch_size, seq_len_out, embedding_dim]
-                - padding_mask  : mask for encoder input padding (passed to the 2nd attention block)
+                - enc_padding_mask  : mask for encoder input padding (passed to the 2nd attention block)
                 - look_ahead_mask   : mask for decoder_input look_ahead (+ padding (optionnal))
                 - training  : whether it is training / inference phase
                 - return_attention  : whether to return attention weights or not
@@ -154,29 +150,28 @@ class TransformerDecoderLayer(tf.keras.layers.Layer):
         target_attn, target_attn_weights  = self.attention(
             target, target, target, mask = look_ahead_mask, training = training
         )
-        target_attn = self.norm_1(target + target_attn, training = training)
         
         enc_attn, enc_attn_weights = self.enc_attention(
-            target_attn, encoder_output, encoder_output, training = training, mask = padding_mask
+            target_attn, encoder_output, encoder_output, mask = enc_padding_mask, training = training
         )
         
         
         ffn_output  = self.ffn(enc_attn, training = training)
         ffn_output  = self.dropout(ffn_output, training = training)
         
-        output = self.norm_2(enc_attn + ffn_output, training = training)
+        output = self.norm(enc_attn + ffn_output, training = training)
     
         return (output, target_attn_weights, enc_attn_weights) if return_attention else output
     
     def get_config(self):
         config = super().get_config()
-        return self.hparams + config
+        return (self.hparams + config).get_config()
     
 class TransformerEncoder(tf.keras.Model):
-    def __init__(self, num_layers, name = None, ** kwargs):
+    def __init__(self, embedding_dim, num_layers, name = None, ** kwargs):
         super().__init__(name = name)
         self.hparams    = HParamsTransformerEncoder.extract(kwargs)
-        self.hparams.num_layers = num_layers
+        self.hparams    = self.hparams(embedding_dim = embedding_dim, num_layers = num_layers)
         
         self.encoder_layers = [
             TransformerEncoderLayer(name = 'layer_{}'.format(i+1), ** self.hparams)
@@ -226,10 +221,10 @@ class TransformerEncoder(tf.keras.Model):
         return cls(** config)
 
 class TransformerDecoder(tf.keras.Model):
-    def __init__(self, num_layers, name = None, ** kwargs):
+    def __init__(self, embedding_dim, num_layers, name = None, ** kwargs):
         super().__init__(name = name)
         self.hparams    = HParamsTransformerDecoder.extract(kwargs)
-        self.hparams.num_layers = num_layers
+        self.hparams    = self.hparams(embedding_dim = embedding_dim, num_layers = num_layers)
         
         self.decoder_layers = [
             TransformerDecoderLayer(name = 'layer_{}'.format(i+1), ** self.hparams)
@@ -239,10 +234,10 @@ class TransformerDecoder(tf.keras.Model):
     def call(self,
              inputs,
              training   = False,
-             padding_mask       = None,
+             enc_padding_mask   = None,
              look_ahead_mask    = None,
              return_attention   = True,
-             return_states      = False,
+             return_states      = False
             ):
         """
             Arguments :
@@ -265,13 +260,13 @@ class TransformerDecoder(tf.keras.Model):
         
         if look_ahead_mask is None:
             look_ahead_mask = create_look_ahead_mask(
-                tf.shape(target)[0], tf.shape(target)[1], tf.float32
+                tf.shape(output)[0], tf.shape(output)[1], tf.float32
             )
         
         for i, layer in enumerate(self.decoder_layers):
             output, attn_weights, enc_attn_weights = layer(
                 [encoder_output, output], training = training, return_attention = True,
-                padding_mask = padding_mask, look_ahead_mask = look_ahead_mask
+                enc_padding_mask = enc_padding_mask, look_ahead_mask = look_ahead_mask
             )
             if return_attention:
                 attn_outputs['attn_{}'.format(layer.name)] = attn_weights
@@ -300,9 +295,11 @@ class Transformer(tf.keras.Model):
     def __init__(self, embedding_dim = None, name = None, ** kwargs):
         super().__init__(name = name)
         self.hparams = HParamsTransformer.extract(kwargs)
+        # Allow to have different embedding dim for encoder and decoder
         if embedding_dim is not None:
-            self.hparams.encoder_embedding_dim = embedding_dim
-            self.hparams.decoder_embedding_dim = embedding_dim
+            self.hparams    = self.hparams(
+                encoder_embedding_dim = embedding_dim, decoder_embedding_dim = embedding_dim
+            )
         
         self.encoder    = TransformerEncoder(
             ** self.hparams.get_config(prefix = 'encoder'), name = 'encoder'
@@ -320,10 +317,13 @@ class Transformer(tf.keras.Model):
     
     @tf.function(experimental_relax_shapes = True)
     def decode(self, encoder_out, decoder_input, training = False,
-               padding_mask = None, look_ahead_mask = None):
+               enc_padding_mask = None, look_ahead_mask = None):
         return self.decoder(
-            [encoder_out, decoder_input], padding_mask = padding_mask,
-            look_ahead_mask = look_ahead_mask, training = training, return_attention = True
+            [encoder_out, decoder_input],
+            enc_padding_mask    = enc_padding_mask,
+            look_ahead_mask     = look_ahead_mask,
+            training    = training,
+            return_attention    = True
         )
         
     def call(self,
@@ -340,8 +340,11 @@ class Transformer(tf.keras.Model):
         )
         
         decoder_out, decoder_attn = self.decode(
-            encoder_out, decoder_input, padding_mask = encoder_padding_mask,
-            look_ahead_mask = look_ahead_mask, training = training
+            encoder_out,
+            decoder_input,
+            enc_padding_mask    = encoder_padding_mask,
+            look_ahead_mask     = look_ahead_mask,
+            training    = training
         )
         
         return decoder_out if not return_attention else (decoder_out, encoder_attn, decoder_attn)
@@ -352,3 +355,20 @@ class Transformer(tf.keras.Model):
     @classmethod
     def from_config(cls, config, custom_objects = None):
         return cls(** config)
+
+custom_functions    = {
+    'FeedForwardNetwork'    : FeedForwardNetwork,
+    'TransformerEncoder'    : TransformerEncoder,
+    'TransformerDecoder'    : TransformerDecoder,
+    'Transformer'       : Transformer
+}
+        
+custom_objects  = {
+    'MultiHeadAttention'        : MultiHeadAttention,
+    
+    'TransformerEncoderLayer'   : TransformerEncoderLayer,
+    'TransformerDecoderLayer'   : TransformerDecoderLayer,
+    'TransformerEncoder'    : TransformerEncoder,
+    'TransformerDecoder'    : TransformerDecoder,
+    'Transformer'       : Transformer
+}

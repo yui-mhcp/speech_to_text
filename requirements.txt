@@ -11,7 +11,7 @@ sounddevice
 librosa
 noisereduce
 num2words
-tensorflow==2.3.2
+tensorflow
 kneed
 tensorflow_datasets
 tqdm

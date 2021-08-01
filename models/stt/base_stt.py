@@ -66,14 +66,14 @@ class BaseSTT(BaseModel):
             cleaner = ['french_cleaners'] if lang == 'fr' else ['english_cleaners']
             
             text_encoder['use_sos_and_eos'] = not self.use_ctc_decoder
-            text_encoder.setdefault('word_level', False)
+            text_encoder.setdefault('level', 'char')
             text_encoder.setdefault('cleaners', cleaner)
             
             if 'vocab' not in text_encoder:
                 text_encoder['vocab'] = get_symbols(
                     lang, maj = False, arpabet = False, ponctuation = 2
                 )
-                text_encoder['word_level'] = False
+                text_encoder['level'] = 'char'
 
             self.text_encoder = TextEncoder(** text_encoder)
             
@@ -297,17 +297,8 @@ class BaseSTT(BaseModel):
             
         super().compile(loss = loss, metrics = metrics, ** kwargs)
     
-    def encode_text(self, phrase):
-        if isinstance(phrase, tf.Tensor):
-            phrase = phrase.numpy()
-            if isinstance(phrase, (list, np.ndarray)):
-                phrase = [p.decode('utf-8') for p in phrase]
-            else:
-                phrase = phrase.decode('utf-8')
-        elif isinstance(phrase, bytes):
-            phrase = phrase.decode('utf-8')
-            
-        return self.text_encoder.encode(phrase)
+    def encode_text(self, text):
+        return self.text_encoder.encode(text)
     
     def decode_text(self, encoded):
         if isinstance(encoded, tf.Tensor): encoded = encoded.numpy()
@@ -367,8 +358,7 @@ class BaseSTT(BaseModel):
         return mel
     
     def encode_data(self, data):
-        text = data['text']
-        encoded_text = tf.py_function(self.encode_text, [text], Tout = tf.int32)
+        encoded_text = tf.py_function(self.encode_text, [data['text']], Tout = tf.int32)
         encoded_text.set_shape([None])
         
         mel = self.get_mel_input(data)
@@ -416,14 +406,10 @@ class BaseSTT(BaseModel):
         return mel, len(mel), text, text_length
         
     def preprocess_data(self, mel, mel_length, text, text_length):
-        text_length = text_length - 1
-        
-        output = (text[:, :-1], text_length)
-        
         if self.use_ctc_decoder:
-            return (mel, mel_length), output
+            return (mel, mel_length), (text, text_length)
         
-        return (mel, mel_length, text[:, 1:], text_length), output
+        return (mel, mel_length, text[:, 1:], text_length - 1), (text[:, :-1], text_length - 1)
         
     def get_dataset_config(self, ** kwargs):
         kwargs['pad_kwargs']    = {
@@ -663,13 +649,14 @@ class BaseSTT(BaseModel):
         
         if filename is not None: write_audio(audio, filename, rate = self.audio_rate)
         
-    def search(self, keyword, audios, ** kwargs):
+    def search(self, keyword, audios, threshold = 0.8, ** kwargs):
         # Get predictions for audios
         pred = self.predict(audios, ** kwargs)
 
         return SearchResult(* [AudioSearch(
-            keyword = keyword, distance_fn = self.distance, filename = infos['filename'],
-            infos = infos['alignment'], directory = self.search_dir, rate = self.audio_rate
+            keyword = keyword, distance_fn = self.distance, rate = self.audio_rate,
+            directory = self.search_dir, filename = infos['filename'],
+            infos = infos['alignment'], threshold = threshold
         ) for infos in pred])
     
     def get_config(self, * args, ** kwargs):
@@ -686,12 +673,12 @@ class BaseSTT(BaseModel):
         return config
     
     @classmethod
-    def build_pretrained_deep_speech(cls, 
-                                     nom      = 'pretrained_deep_speech',
-                                     lang     = 'en',
-                                     vocab    = _deep_speech_en_symbols, 
-                                     ** kwargs
-                                    ):
+    def build_from_deep_speech_pretrained(cls, 
+                                          nom      = 'pretrained_deep_speech',
+                                          lang     = 'en',
+                                          vocab    = _deep_speech_en_symbols, 
+                                          ** kwargs
+                                         ):
         mel_fn = DeepSpeechSTFT(
             sampling_rate   = 16000,
             n_mel_channels  = 160,
@@ -703,10 +690,10 @@ class BaseSTT(BaseModel):
         
         text_encoder = TextEncoder(
             vocab           = vocab, 
-            word_level      = False,
+            level           = 'char',
             vocab_size      = kwargs.pop('vocab_size', None),
             cleaners        = kwargs.pop('cleaners', ['english_cleaners']),
-            ukn_text        = None, 
+            ukn_token       = None, 
             use_sos_and_eos = False, 
             name            = 'DeepSpeech text encoder'
         )
@@ -717,13 +704,13 @@ class BaseSTT(BaseModel):
             text_encoder = text_encoder,
             mel_fn_type  = mel_fn, 
             max_to_keep  = 1,
+            pretrained_name = 'pretrained_deep_speech',
             ** kwargs
         )
         
         with tf.device('cpu') as dev:
             pretrained_model = get_architecture(
-                'DeepSpeech2', input_shape = (None, 160), vocab_size = 29,
-                pretrained = True
+                'DeepSpeech2', input_shape = (None, 160), vocab_size = 29, pretrained = True
             )
         
         partial_transfer_learning(instance.stt_model, pretrained_model)
@@ -733,12 +720,12 @@ class BaseSTT(BaseModel):
         return instance
 
     @classmethod
-    def build_pretrained_jasper(cls, 
-                                nom     = 'pretrained_jasper',
-                                lang    = 'en', 
-                                vocab   = _deep_speech_en_symbols, 
-                                ** kwargs
-                               ):
+    def build_from_jasper_pretrained(cls, 
+                                     nom     = 'pretrained_jasper',
+                                     lang    = 'en', 
+                                     vocab   = _deep_speech_en_symbols, 
+                                     ** kwargs
+                                    ):
         mel_fn = JasperSTFT(
             sampling_rate   = 16000,
             n_mel_channels  = 64,
@@ -750,10 +737,10 @@ class BaseSTT(BaseModel):
         
         text_encoder = TextEncoder(
             vocab           = vocab, 
-            word_level      = False,
+            level           = 'char',
             vocab_size      = kwargs.pop('vocab_size', None),
             cleaners        = kwargs.pop('cleaners', ['english_cleaners']),
-            ukn_text        = None, 
+            ukn_token       = None, 
             use_sos_and_eos = False, 
             name            = 'Jasper text encoder'
         )
@@ -764,6 +751,7 @@ class BaseSTT(BaseModel):
             text_encoder = text_encoder,
             mel_fn_type  = mel_fn, 
             max_to_keep  = 1,
+            pretrained_name = 'pretrained_jasper',
             ** kwargs
         )
         

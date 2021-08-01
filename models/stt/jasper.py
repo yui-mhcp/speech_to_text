@@ -10,4 +10,5 @@ class Jasper(BaseSTT):
         super().__init__(* args, ** kwargs)
 
     def call(self, inputs, training = False):
-        return super().call(inputs[0], training = training)
+        if isinstance(inputs, (list, tuple)): inputs = inputs[0]
+        return super().call(inputs, training = training)
