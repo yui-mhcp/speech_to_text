@@ -2,7 +2,7 @@ import tensorflow as tf
 
 class TextLoss(tf.keras.losses.Loss):
     def __init__(self, pad_value = 0, name = 'TextLoss', **kwargs):
-        super(TextLoss, self).__init__(name = name, **kwargs)
+        super().__init__(name = name, ** kwargs)
         self.pad_value = pad_value
         
     def call(self, y_true, y_pred):
@@ -10,7 +10,7 @@ class TextLoss(tf.keras.losses.Loss):
             target_length = tf.reduce_sum(tf.cast(tf.math.not_equal(y_true, self.pad_value), tf.int32), axis = -1)
         else:
             y_true, target_length = y_true
-        
+
         padding_mask    = tf.sequence_mask(
             target_length, maxlen = tf.reduce_max(target_length), dtype = tf.float32
         )
@@ -22,6 +22,6 @@ class TextLoss(tf.keras.losses.Loss):
         return tf.reduce_mean(loss)
     
     def get_config(self):
-        config = super(TextLoss, self).get_config()
+        config = super().get_config()
         config['pad_value']     = self.pad_value
         return config

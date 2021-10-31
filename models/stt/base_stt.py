@@ -7,16 +7,18 @@ import tensorflow as tf
 
 from tqdm import tqdm
 
+from models.base_model import BaseModel
+from custom_architectures import get_architecture
+from models.weights_converter import partial_transfer_learning
 from utils import dump_json, load_json, normalize_filename, pad_batch
 from utils.audio import load_mel, load_audio, write_audio
 from utils.audio import MelSTFT, DeepSpeechSTFT, JasperSTFT, AudioAnnotation, AudioSearch, SearchResult
-from utils.text import get_symbols, TextEncoder, accent_replacement_matrix
-from custom_architectures import get_architecture
-from models.base_model import BaseModel
-from models.weights_converter import partial_transfer_learning
+from utils.text import get_encoder, get_symbols, TextEncoder, accent_replacement_matrix, decode
 
 _silent_char    = list(" '\"")
 _deep_speech_en_symbols = list(" abcdefghijklmnopqrstuvwxyz'") + ['']
+
+MIN_AUDIO_TIME  = 0.1
 
 DEFAULT_MAX_MEL_LENGTH  = 1024
 DEFAULT_MAX_TEXT_LENGTH = min(256, DEFAULT_MAX_MEL_LENGTH // 2)
@@ -61,29 +63,16 @@ class BaseSTT(BaseModel):
         self.max_input_length   = max_input_length
         self.max_output_length  = max_output_length
         
-        if text_encoder is None: text_encoder = {}
-        if isinstance(text_encoder, dict):
-            cleaner = ['french_cleaners'] if lang == 'fr' else ['english_cleaners']
-            
-            text_encoder['use_sos_and_eos'] = not self.use_ctc_decoder
-            text_encoder.setdefault('level', 'char')
-            text_encoder.setdefault('cleaners', cleaner)
-            
-            if 'vocab' not in text_encoder:
-                text_encoder['vocab'] = get_symbols(
-                    lang, maj = False, arpabet = False, ponctuation = 2
-                )
-                text_encoder['level'] = 'char'
-
-            self.text_encoder = TextEncoder(** text_encoder)
-            
-        elif isinstance(text_encoder, str):
-            self.text_encoder = TextEncoder.load_from_file(text_encoder)
-        elif isinstance(text_encoder, TextEncoder):
-            self.text_encoder = text_encoder
-        else:
-            raise ValueError("Text encoder de type inconnu : {}".format(text_encoder))
         
+        self.text_encoder = get_encoder(
+            text_encoder = text_encoder,
+            lang    = lang,
+            vocab   = get_symbols(
+                lang, maj = False, arpabet = False, punctuation = 2
+            ),
+            use_sos_and_eos = not self.use_ctc_decoder
+        )
+            
         # Initialization of mel fn
         if isinstance(mel_fn_type, MelSTFT):
             self.mel_fn = mel_fn_type
@@ -172,6 +161,10 @@ class BaseSTT(BaseModel):
         else:
             return (mel_length, self.n_mel_channels, 1)
     
+    @property
+    def decoder_method(self):
+        if not self.use_ctc_decoder: return 'greedy'
+        return 'beam_search'
     
     @property
     def input_signature(self):
@@ -301,23 +294,15 @@ class BaseSTT(BaseModel):
         return self.text_encoder.encode(text)
     
     def decode_text(self, encoded):
-        if isinstance(encoded, tf.Tensor): encoded = encoded.numpy()
-        if len(encoded.shape) == 1:
-            return self.text_encoder.decode(encoded)
-        elif len(encoded.shape) == 2:
-            return [self.decode_text(p) for p in encoded]
-        else:
-            raise ValueError("Unknown shape : {}".format(encoded.shape))
+        return self.text_encoder.decode(encoded)
     
     def decode_output(self, output, * args, ** kwargs):
-        if len(output.shape) == 1:
+        if len(output.shape) in (1, 2):
             return self.decode_text(output)
-        elif len(output.shape) == 2:
-            return [self.decode_output(o) for o in output]
         elif len(output.shape) == 3:
-            pred = tf.argmax(output, axis = -1)
+            pred = decode(output, method = self.decoder_method, blank_idx = self.blank_token_idx, ** kwargs)
             if self.use_ctc_decoder:
-                pred = [np.array([k for k, _ in itertools.groupby(p)]) for p in pred]
+                #pred = [np.array([k for k, _ in itertools.groupby(p)]) for p in pred]
                 return [self.decode_output(p) for p in pred]
             else:
                 return [self.decode_output(p) for p in pred]
@@ -536,9 +521,9 @@ class BaseSTT(BaseModel):
         # Normalize variables
         filenames = normalize_filename(filenames, invalid_mode = 'keep')
         
-        if not isinstance(filenames, (list, tuple)): filenames = [filenames]
-        if alignments is not None and not isinstance(alignment, (list, tuple)):
-            alignments = [alignments]
+        if not isinstance(filenames, (list, tuple)):
+            if alignments is not None: alignments = [alignments]
+            filenames = [filenames]
         
         # Define directories
         if directory is None: directory = self.pred_dir
@@ -553,10 +538,12 @@ class BaseSTT(BaseModel):
         outputs = []
         for i, filename in enumerate(filenames):
             # Get associated alignment
-            alignment = None if alignments is None else alignments[i]
+            alignment = alignments[i] if alignments is not None else None
             
             if isinstance(filename, AudioAnnotation):
-                filename, alignment = filename.filename, filanem.alignment
+                filename, alignment = filename.filename, filanem._alignment
+            elif isinstance(filename, dict):
+                filename, alignment = filename['filename'], filename.get('alignment', alignment)
             # Load (or save) audio
             if isinstance(filename, str):
                 if filename in all_outputs and not overwrite:
@@ -586,7 +573,7 @@ class BaseSTT(BaseModel):
                 int(info['start'] * self.audio_rate) : int(info['end'] * self.audio_rate)
             ] for info in alignment]
             inputs = [
-                self.get_mel_input(a) for a in inputs if len(a) > self.audio_rate * .1
+                self.get_mel_input(a) for a in inputs if len(a) > self.audio_rate * MIN_AUDIO_TIME
             ]
             
             # Get text result 
