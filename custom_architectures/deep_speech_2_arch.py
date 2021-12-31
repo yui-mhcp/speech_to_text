@@ -1,4 +1,5 @@
 import os
+import logging
 import numpy as np
 import tensorflow as tf
 
@@ -116,7 +117,7 @@ def maybe_download_from_bucket(bucket_name: str, remote_path: str, local_path: s
         return
     directory = os.path.dirname(local_path)
     os.makedirs(directory, exist_ok=True)
-    print('Downloading file from the bucket...')
+    logging.info('Downloading file from the bucket...')
     download_from_bucket(bucket_name, remote_path, local_path)
 
 custom_functions    = {

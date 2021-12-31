@@ -1,33 +1,33 @@
 import os
 
+from models.model_utils import get_model_config
+
 from models.stt.base_stt import BaseSTT
 from models.stt.jasper import Jasper
 from models.stt.deep_speech import DeepSpeech
 from models.stt.transformer_stt import TransformerSTT
 
-from utils.generic_utils import load_json
+def get_model_lang(model):
+    return get_model_config(model).get('lang', None)
+
+def get_model_name(lang):
+    if lang not in _pretrained:
+        raise ValueError('Unknown language for pretrained TTS model\n  Accepted : {}\n  Got : {}'.format(tuple(_pretrained.keys()), lang))
+    return _pretrained[lang]
 
 def get_model(lang = None, model = None, ** kwargs):
-    assert lang is not None or model is not None
     if model is None:
-        if lang not in _pretrained:
-            raise ValueError("No pretrained model for this language !!\n  Supported : {}\n   Got : {}".format(list(_pretrained.keys()), lang))
-        
-        model = _pretrained[lang]
+        assert lang is not None, "You must specify either the model or the language !"
+        model = get_model_name(lang)
     
     if isinstance(model, str):
-        config_file = os.path.join('pretrained_models', model, 'config.json')
-        model_class = load_json(config_file).get('class_name', None)
-        
-        if model_class is None or model_class not in _models:
-            raise ValueError("Unknown model class : !\n  Accepted : {}\n  Got : {}".format(list(_models.keys()), model_class))
-        
-        model = _models[model_class](nom = model)
+        from models import get_pretrained
+        model = get_pretrained(model)
     
     return model
 
 def search(keyword, audios, lang = None, model = None, ** kwargs):
-    model = get_model(lang, model = model)
+    model = get_model(lang = lang, model = model)
     return model.search(keyword, audios, ** kwargs)
 
 def predict(audios, lang = None, model = None, ** kwargs):
@@ -38,7 +38,6 @@ def predict(audios, lang = None, model = None, ** kwargs):
 _pretrained = {
     'en'    : 'pretrained_jasper'
 }
-
 
 _models = {
     'BaseSTT'   : BaseSTT,

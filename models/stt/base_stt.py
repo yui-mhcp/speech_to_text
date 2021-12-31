@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 import datetime
 import itertools
 import numpy as np
@@ -7,6 +8,7 @@ import tensorflow as tf
 
 from tqdm import tqdm
 
+from loggers import timer
 from models.base_model import BaseModel
 from custom_architectures import get_architecture
 from models.weights_converter import partial_transfer_learning
@@ -14,6 +16,8 @@ from utils import dump_json, load_json, normalize_filename, pad_batch
 from utils.audio import load_mel, load_audio, write_audio
 from utils.audio import MelSTFT, DeepSpeechSTFT, JasperSTFT, AudioAnnotation, AudioSearch, SearchResult
 from utils.text import get_encoder, get_symbols, TextEncoder, accent_replacement_matrix, decode
+
+time_logger = logging.getLogger('timer')
 
 _silent_char    = list(" '\"")
 _deep_speech_en_symbols = list(" abcdefghijklmnopqrstuvwxyz'") + ['']
@@ -251,6 +255,7 @@ class BaseSTT(BaseModel):
         des += "Output vocab (size = {}) : {}\n".format(self.vocab_size, self.vocab)
         return des
     
+    @timer(name = 'prediction', log_if_root = False)
     def call(self, inputs, training = False):
         """
             Arguments : 
@@ -271,6 +276,7 @@ class BaseSTT(BaseModel):
         """
         return self.stt_model(inputs, training = training)
     
+    @timer(name = 'inference', log_if_root = False)
     def infer(self, inputs, training = False, decode = False, ** kwargs):
         if self.use_ctc_decoder:
             output = self(inputs, training = training)
@@ -310,6 +316,7 @@ class BaseSTT(BaseModel):
             raise ValueError("Invalid shape : {}".format(output.shape))
     
         
+    @timer
     def distance(self, hypothesis, truth, ** kwargs):
         kwargs.setdefault('insertion_cost', {})
         kwargs.setdefault('deletion_cost', {})
@@ -456,12 +463,15 @@ class BaseSTT(BaseModel):
                 
         target = self.decode_output(text)
         
+        des = ""
         for i in range(len(target)):
-            print("  Target     : {}".format(target[i]))
-            print("  Prediction : {}".format(pred[i]))
-            if infer is not None: print("  Inference  : {}".format(infer[i]))
-        print()
-                
+            des = "  Target     : {}\n  Prediction : {}{}\n".format(
+                target[i], pred[i],
+                "" if infer is None else "\n  Inference  : {}".format(infer[i])
+            )
+        logging.info(des)
+    
+    @timer
     def predict(self,
                 filenames,
                 alignments  = None,
@@ -479,6 +489,7 @@ class BaseSTT(BaseModel):
                 tqdm    = tqdm,
                 ** kwargs
                ):
+        @timer(name = 'post processing')
         def combine_text(alignments, max_err):
             if len(alignments) == 0: return ''
             if max_err < 1: max_err = int(max_err * 100.)
@@ -550,15 +561,16 @@ class BaseSTT(BaseModel):
                     outputs.append(all_outputs[filename])
                     continue
                 
+                time_logger.start_timer('processing')
                 audio = self.get_audio_input(filename)
+                time_logger.stop_timer('processing')
             else:
                 audio = filename
                 if save:
                     filename = 'audio_{}.wav'.format(len(os.listdir(audio_dir)))
                     write_audio(audio, filename, rate = self.audio_rate)
             
-            if verbose:
-                print("Processing file {}...".format(filename))
+            logging.info("Processing file {}...".format(filename))
             
             audio_time = int(len(audio) / self.audio_rate)
             if alignment is None:
@@ -568,6 +580,7 @@ class BaseSTT(BaseModel):
                     'text'  : ''
                 } for t in np.arange(0, audio_time, time_step)]
             
+            time_logger.start_timer('processing')
             # Slice audio by step with part of length `window` (and remove part < 0.1 sec)
             inputs = [audio[
                 int(info['start'] * self.audio_rate) : int(info['end'] * self.audio_rate)
@@ -575,6 +588,7 @@ class BaseSTT(BaseModel):
             inputs = [
                 self.get_mel_input(a) for a in inputs if len(a) > self.audio_rate * MIN_AUDIO_TIME
             ]
+            time_logger.stop_timer('processing')
             
             # Get text result 
             text_outputs = []
@@ -635,7 +649,8 @@ class BaseSTT(BaseModel):
         print("\n\nPrediction : {}\n".format(text))
         
         if filename is not None: write_audio(audio, filename, rate = self.audio_rate)
-        
+    
+    @timer
     def search(self, keyword, audios, threshold = 0.8, ** kwargs):
         # Get predictions for audios
         pred = self.predict(audios, ** kwargs)
@@ -658,97 +673,3 @@ class BaseSTT(BaseModel):
         config['use_fixed_length_input']    = self.use_fixed_length_input
         
         return config
-    
-    @classmethod
-    def build_from_deep_speech_pretrained(cls, 
-                                          nom      = 'pretrained_deep_speech',
-                                          lang     = 'en',
-                                          vocab    = _deep_speech_en_symbols, 
-                                          ** kwargs
-                                         ):
-        mel_fn = DeepSpeechSTFT(
-            sampling_rate   = 16000,
-            n_mel_channels  = 160,
-            filter_length   = 0.02,
-            hop_length      = 0.01,
-            win_length      = 0.02,
-            normalize_mode  = 'per_feature'
-        )
-        
-        text_encoder = TextEncoder(
-            vocab           = vocab, 
-            level           = 'char',
-            vocab_size      = kwargs.pop('vocab_size', None),
-            cleaners        = kwargs.pop('cleaners', ['english_cleaners']),
-            ukn_token       = None, 
-            use_sos_and_eos = False, 
-            name            = 'DeepSpeech text encoder'
-        )
-            
-        instance = cls(
-            nom     = nom,
-            lang    = lang,
-            text_encoder = text_encoder,
-            mel_fn_type  = mel_fn, 
-            max_to_keep  = 1,
-            pretrained_name = 'pretrained_deep_speech',
-            ** kwargs
-        )
-        
-        with tf.device('cpu') as dev:
-            pretrained_model = get_architecture(
-                'DeepSpeech2', input_shape = (None, 160), vocab_size = 29, pretrained = True
-            )
-        
-        partial_transfer_learning(instance.stt_model, pretrained_model)
-        
-        instance.save()
-        
-        return instance
-
-    @classmethod
-    def build_from_jasper_pretrained(cls, 
-                                     nom     = 'pretrained_jasper',
-                                     lang    = 'en', 
-                                     vocab   = _deep_speech_en_symbols, 
-                                     ** kwargs
-                                    ):
-        mel_fn = JasperSTFT(
-            sampling_rate   = 16000,
-            n_mel_channels  = 64,
-            filter_length   = 512,
-            hop_length      = 0.01,
-            win_length      = 0.02,
-            normalize_mode  = 'per_feature'
-        )
-        
-        text_encoder = TextEncoder(
-            vocab           = vocab, 
-            level           = 'char',
-            vocab_size      = kwargs.pop('vocab_size', None),
-            cleaners        = kwargs.pop('cleaners', ['english_cleaners']),
-            ukn_token       = None, 
-            use_sos_and_eos = False, 
-            name            = 'Jasper text encoder'
-        )
-        
-        instance = cls(
-            nom     = nom,
-            lang    = lang,
-            text_encoder = text_encoder,
-            mel_fn_type  = mel_fn, 
-            max_to_keep  = 1,
-            pretrained_name = 'pretrained_jasper',
-            ** kwargs
-        )
-        
-        with tf.device('cpu') as dev:
-            pretrained_model = get_architecture(
-                'Jasper', input_shape = (None, 64), vocab_size = 29, pretrained = True
-            )
-        
-        partial_transfer_learning(instance.stt_model, pretrained_model)
-        
-        instance.save()
-        
-        return instance
