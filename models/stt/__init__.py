@@ -5,7 +5,6 @@ from models.model_utils import get_model_config
 from models.stt.base_stt import BaseSTT
 from models.stt.jasper import Jasper
 from models.stt.deep_speech import DeepSpeech
-from models.stt.transformer_stt import TransformerSTT
 
 def get_model_lang(model):
     return get_model_config(model).get('lang', None)
@@ -42,6 +41,5 @@ _pretrained = {
 _models = {
     'BaseSTT'   : BaseSTT,
     'Jasper'    : Jasper,
-    'DeepSpeech'    : DeepSpeech,
-    'TransformerSTT'    : TransformerSTT
+    'DeepSpeech'    : DeepSpeech
 }
