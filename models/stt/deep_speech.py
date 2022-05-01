@@ -22,7 +22,7 @@ from models.stt.base_stt import BaseSTT, _deep_speech_en_symbols
 class DeepSpeech(BaseSTT):
     def __init__(self, * args, ** kwargs):
         kwargs.update({
-            'mel_as_image'      : False,
+            'audio_format'      : 'mel',
             'use_ctc_decoder'   : True,
             'architecture_name' : 'deep_speech_2'
         })
@@ -62,8 +62,9 @@ class DeepSpeech(BaseSTT):
         instance = cls(
             nom     = nom,
             lang    = lang,
+            mel_fn  = mel_fn, 
             text_encoder = text_encoder,
-            mel_fn_type  = mel_fn, 
+            
             max_to_keep  = 1,
             pretrained_name = 'pretrained_deep_speech',
             ** kwargs

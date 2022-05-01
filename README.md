@@ -76,7 +76,9 @@ Models must be unzipped in the `pretrained_models/` directory !
 - [x] Comment the code
 - [x] Add support for pretrained `DeepSpeech2`
 - [x] Add support for pretrained `Jasper` (from [NVIDIA's official repository](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/SpeechRecognition/Jasper))
+- [x] Add Beam-Search decoding (for acoustic models)
 - [ ] Add new languages support
+- [ ] Implement `Transformer`-based STT models (such as `TransformerSTT` and `Conformer`) (in progress)
 
 ## Search and partial alignment
 
