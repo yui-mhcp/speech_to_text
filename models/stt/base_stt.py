@@ -76,7 +76,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         os.makedirs(self.search_dir, exist_ok = True)
 
     def _build_model(self, architecture_name, ** kwargs):
-        super()._build_model(
+        super(BaseSTT, self)._build_model(
             stt_model = {
                 'architecture_name' : architecture_name,
                 'input_shape'   : self.mel_input_shape,
@@ -162,11 +162,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     @timer(name = 'inference', log_if_root = False)
     def infer(self, inputs, training = False, decode = False, ** kwargs):
         if self.use_ctc_decoder:
-            output = self(inputs, training = training)
-            return output if not decode else self.decode_output(output)
-
-        output = self.stt_model.infer(inputs, training = training, ** kwargs)
-        return output if not decode else (self.decode_output(output[0]), output[1])
+            output = self(inputs, training = training, ** kwargs)
+        else:
+            output = self.stt_model.infer(inputs, training = training, ** kwargs)
+        
+        return self.decode_output(output) if decode else output
     
     def compile(self, loss = None, metrics = None, ** kwargs):
         if loss is None:
@@ -228,7 +228,13 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         if self.use_ctc_decoder:
             return (mel, mel_length), (text, text_length)
         
-        return (mel, mel_length, text[:, 1:], text_length - 1), (text[:, :-1], text_length - 1)
+        text_in, text_out = text, text
+        text_in_len, text_out_len   = text_length, text_length
+        if self.text_encoder.use_sos_and_eos:
+            text_in, text_in_len    = text_in[:, :-1], text_in_len - 1
+            text_out, text_out_len  = text_out[:, 1:], text_out_len - 1
+        
+        return (mel, mel_length, text_in, text_in_len), (text_out, text_out_len)
         
     def get_dataset_config(self, ** kwargs):
         kwargs.update({
@@ -251,7 +257,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         with tf.GradientTape() as tape:
             pred = self(inputs, training = True)
-            if not self.use_ctc_decoder: pred, _ = pred
+            if isinstance(pred, tuple): pred, _ = pred
             
             loss = self.stt_model_loss(target, pred)
         
@@ -266,7 +272,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         inputs, target = batch
 
         pred = self(inputs, training = False)
-        if not self.use_ctc_decoder: pred, _ = pred
+        if isinstance(pred, tuple): pred, _ = pred
         
         return self.update_metrics(target, pred)
     
@@ -281,11 +287,12 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             pred = self.decode_output(pred)
             infer = None
         else:
-            pred, _ = self(inputs, training = False)
-            infer, _ = self.infer(
-                inputs[:2] if not self.use_ctc_decoder else inputs,
+            pred = self(inputs, training = False)
+            infer = self.infer(
+                inputs[:-2] if not self.use_ctc_decoder else inputs,
                 max_length      = max_length,
-                early_stopping  = False
+                early_stopping  = False,
+                decode  = True
             )
         
             pred    = self.decode_output(pred)
@@ -392,13 +399,13 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                     continue
                 
                 time_logger.start_timer('processing')
-                audio = self.get_audio_input(filename)
+                audio = self.get_audio_input(filename)[:, 0]
                 time_logger.stop_timer('processing')
             else:
                 audio = filename
                 if save:
                     filename = 'audio_{}.wav'.format(len(os.listdir(audio_dir)))
-                    write_audio(audio, filename, rate = self.audio_rate)
+                    write_audio(audio = audio, filename = filename, rate = self.audio_rate)
             
             logging.info("Processing file {}...".format(filename))
             
@@ -416,7 +423,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 int(info['start'] * self.audio_rate) : int(info['end'] * self.audio_rate)
             ] for info in alignment]
             inputs = [
-                self.get_mel_input(a) for a in inputs if len(a) > self.audio_rate * MIN_AUDIO_TIME
+                self.get_audio(a) for a in inputs if len(a) > self.audio_rate * MIN_AUDIO_TIME
             ]
             time_logger.stop_timer('processing')
             
@@ -428,7 +435,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 
                 batch   = [pad_batch(mels, pad_value = self.pad_mel_value), length]
                 pred    = self.infer(batch, decode = True)
-                if not self.use_ctc_decoder: pred, _ = pred
+                if isinstance(pred, tuple): pred, _ = pred
                 
                 text_outputs += pred
             
@@ -484,7 +491,8 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
 
         print("\n\nPrediction : {}\n".format(text))
         
-        if filename is not None: write_audio(audio, filename, rate = self.audio_rate)
+        if filename is not None:
+            write_audio(audio = audio, filename = filename, rate = self.audio_rate)
     
     @timer
     def search(self, keyword, audios, threshold = 0.8, ** kwargs):

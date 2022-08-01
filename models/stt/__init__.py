@@ -17,6 +17,8 @@ from models.model_utils import get_model_config
 from models.stt.base_stt import BaseSTT
 from models.stt.jasper import Jasper
 from models.stt.deep_speech import DeepSpeech
+from models.stt.transformer_stt import TransformerSTT
+from models.stt.conformer_transducer import ConformerTransducer
 
 def get_model_lang(model):
     return get_model_config(model).get('lang', None)
@@ -47,11 +49,14 @@ def predict(audios, lang = None, model = None, ** kwargs):
 
 
 _pretrained = {
-    'en'    : 'pretrained_jasper'
+    'en'    : 'stt_en_conformer_transducer_medium',
+    'fr'    : 'stt_fr_conformer_transducer_large'
 }
 
 _models = {
     'BaseSTT'   : BaseSTT,
     'Jasper'    : Jasper,
-    'DeepSpeech'    : DeepSpeech
+    'DeepSpeech'    : DeepSpeech,
+    'TransformerSTT'    : TransformerSTT,
+    'ConformerTransducer'   : ConformerTransducer
 }

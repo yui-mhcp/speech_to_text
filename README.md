@@ -34,10 +34,11 @@ See [my base project](https://github.com/yui-mhcp/base_dl_project) for more info
 | :-------- | :---------------- | :---------- |
 | Speech-To-Text    | `stt`             | Perform `STT` on audio / video      |
 | search            | `search`          | Search a word on audio / video and display timestamps |
+| stream            | `{model}.stream`  | Speech-To-Text on your microphone (experimental)  |
 
 You can check the `speech_to_text` notebook for a concrete demonstration
 
-**Note** : models are not performant enough for real *transcription / subtitles generation* but the search feature works quite well. 
+**Note** : models are not performant enough for real *transcription / subtitles generation* but the search feature works quite well. The `Conformer-Transducers` models tend to be good enough for transcription but it is currently an experimental feature which will be improved.
 
 ## Available models
 
@@ -47,8 +48,11 @@ Available architectures :
 - `CTC decoders` :
     - [DeepSpeech2](https://www.paperswithcode.com/paper/deep-speech-2-end-to-end-speech-recognition)
     - [Jasper](https://www.paperswithcode.com/paper/jasper-an-end-to-end-convolutional-neural)
+    - [Conformer](https://arxiv.org/pdf/2005.08100.pdf)
 - `Generative models` :
     - [Speech Transformer](https://ieeexplore.ieee.org/document/8462506)
+    - [RNN Transducer (RNN-T)](https://www.arxiv-vanity.com/papers/1911.01629/)
+    - [Conformer Transducer](https://www.arxiv-vanity.com/papers/1911.01629/) : `RNN-T` based model with the `Conformer` architecture as encoder.
 
 ### Model weights
 
@@ -56,6 +60,11 @@ Available architectures :
 | :-------: | :-------: | :-----------: | :-------: | :-------: |
 | `en`      | `LibriSpeech` | `Jasper`  | [NVIDIA](https://github.com/NVIDIA)   | [Google Drive](https://drive.google.com/file/d/1JViFiy-JZ8VYTlaZPVDMZfg0qWcY5-U8/view?usp=sharing)\*  |
 | `fr`      | `SIWIS`, `VoxForge`, `Common Voice`   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1R9lXaEj4etAyyfy7r3tYNnO5FPwQ7RXS/view?usp=sharing)  |
+| `en`      | Many datasets | `ConformerTransducer` | [NVIDIA](https://github.com/NVIDIA) | [Google Drive](https://drive.google.com/file/d/1OpWBvkERK9IVQ1BZPsBHOs46tWn_H2mZ/view?usp=sharing)  |
+| `fr`      | Many datasets | `ConformerTransducer` | [NVIDIA](https://github.com/NVIDIA) | [Google Drive](https://drive.google.com/file/d/1cftQBZEmKL-2fLKpmboWTXIvgFgccsPf/view?usp=sharing)  |
+
+
+`ConformerTransducer` models come from the [NVIDIA NeMo project](https://github.com/NVIDIA/NeMo) but are converted in tensorflow weights. To re-create them from NeMo, you have to clone the NeMo project and use the `ConformerTransducer.from_nemo_pretrained` method.
 
 **Warning** : `Jasper` model weights are 3Go files !
 
@@ -78,7 +87,11 @@ Models must be unzipped in the `pretrained_models/` directory !
 - [x] Add support for pretrained `Jasper` (from [NVIDIA's official repository](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/SpeechRecognition/Jasper))
 - [x] Add Beam-Search decoding (for acoustic models)
 - [ ] Add new languages support
-- [ ] Implement `Transformer`-based STT models (such as `TransformerSTT` and `Conformer`) (in progress)
+- [x] Implement `Transformer`-based STT models (such as `TransformerSTT` and `Conformer`) (in progress)
+- [x] Implement a `RNN-T` based STT model (such as `Conformer Transducer`)
+- [ ] Add `producer-consumer` based inference
+- [x] Add `producer-consumer` based streaming (currently only for `conformer-transducer`)
+- [x] Add streaming support
 
 ## Search and partial alignment
 
@@ -145,7 +158,8 @@ If you use this project in your work, please add this citation to give it more v
 ## Notes and references
 
 Github : 
-- [NVIDIA's project](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/SpeechRecognition/Jasper) : repository where pretrained weights come from (I converted pytorch checkpoint to tensorflow checkpoint using my `weights_converter` script). 
+- [NVIDIA's project](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/SpeechRecognition/Jasper) : repository where pretrained weights come from (I converted pytorch checkpoint to tensorflow checkpoint using my `weights_converter` script).
+- [NVIDIA's NeMo project](https://github.com/NVIDIA/NeMo) : the Conformer and the RNN-T implementations are inspired from this github (but converted to tensorflow).
 - [Automatic Speech Recognition project](https://github.com/rolczynski/Automatic-Speech-Recognition) : project where pretrained DeepSpeech2 weights come from. 
 
 Papers :
@@ -153,7 +167,11 @@ Papers :
 - [2] [Jasper: An End-to-End Convolutional Neural Acoustic Model](https://www.paperswithcode.com/paper/jasper-an-end-to-end-convolutional-neural) : the original Jasper paper
 - [3] [Speech-Transformer: A No-Recurrence Sequence-to-Sequence Model for Speech Recognition](https://ieeexplore.ieee.org/document/8462506) : original SpeechTransformer paper
 - [4] [A technique for computer detection and correction of spelling errors](https://dl.acm.org/doi/10.1145/363958.363994) : Levenshtein distance paper
+- [5] [RNN-T for Latency Controlled ASR WITH IMPROVED BEAM SEARCH](https://www.arxiv-vanity.com/papers/1911.01629/) : RNN-Transducer paper (maybe not the original one)
+- [6] [Conformer: Convolution-augmented Transformer for Speech Recognition](https://arxiv.org/abs/2005.08100) : Conformer original paper
 
 Tutorials : 
 - [Keras tutorial](https://keras.io/examples/audio/transformer_asr/) : tutorial on speech recognition with Transformers. The model is implemented in this repo but I did not achieve to reproduce results on a french dataset
 - [Levenshtein distance computation](https://blog.paperspace.com/measuring-text-similarity-using-levenshtein-distance/) : a Step-by-Step computation (by hand) of the Levenshtein distance
+- [NVIDIA NeMo project](https://developer.nvidia.com/nvidia-nemo) : main website for NVIDIA NeMo project, containing a lot of tutorials on NLP in general (ASR, TTS, ...). 
+- [Comparing End-To-End Speech Recognition Architectures in 2021](https://www.assemblyai.com/blog/a-survey-on-end-to-end-speech-recognition-architectures-in-2021/) : good comparison between different STT architectures
