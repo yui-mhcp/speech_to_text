@@ -19,12 +19,14 @@ import tensorflow as tf
 from tqdm import tqdm
 
 from loggers import timer
+from utils.thread_utils import Pipeline
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_audio_model import BaseAudioModel
 from utils import dump_json, load_json, normalize_filename, pad_batch
-from utils.audio import write_audio, AudioAnnotation, AudioSearch, SearchResult
+from utils.audio import write_audio, load_audio, AudioAnnotation, AudioSearch, SearchResult
 from utils.text import get_encoder, get_symbols, accent_replacement_matrix, decode
 
+logger      = logging.getLogger(__name__)
 time_logger = logging.getLogger('timer')
 
 _silent_char    = list(" '\"")
@@ -68,8 +70,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         self.max_output_length  = max_output_length
         
         super().__init__(** kwargs)
-        
-        if hasattr(self.stt_model, '_build'): self.stt_model._build()
     
     def _init_folders(self):
         super()._init_folders()
@@ -131,6 +131,10 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     def sep_token(self):
         return '-'
     
+    @property
+    def is_encoder_decoder(self):
+        return True if hasattr(self.stt_model, 'decoder') else False
+    
     def __str__(self):
         des = super().__str__()
         des += self._str_text()
@@ -167,6 +171,23 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             output = self.stt_model.infer(inputs, training = training, ** kwargs)
         
         return self.decode_output(output) if decode else output
+    
+    def encode(self, inputs, training = False, ** kwargs):
+        if self.use_ctc_decoder:
+            return self(inputs, training = training, ** kwargs)
+        return self.stt_model.encoder(inputs, training = training, ** kwargs)
+    
+    def decode(self, encoder_output, training = False, return_state = False, ** kwargs):
+        if len(tf.shape(encoder_output)) == 2:
+            encoder_output = tf.expand_dims(encoder_output, axis = 0)
+        
+        if self.use_ctc_decoder:
+            return encoder_output if not return_state else (encoder_output, None)
+
+        return self.stt_model.infer(
+            encoder_output = encoder_output, training = training, return_state = return_state,
+            ** kwargs
+        )
     
     def compile(self, loss = None, metrics = None, ** kwargs):
         if loss is None:
@@ -206,10 +227,13 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return self.text_encoder.distance(hypothesis, truth, ** kwargs)
     
+    def get_input(self, data):
+        return self.get_audio(data)
+    
     def encode_data(self, data):
         encoded_text = self.tf_encode_text(data)
         
-        mel = self.get_audio(data)
+        mel = self.get_input(data)
         
         return mel, len(mel), encoded_text, len(encoded_text)
     
@@ -306,7 +330,166 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 target[i], pred[i],
                 "" if infer is None else "\n  Inference  : {}".format(infer[i])
             )
-        logging.info(des)
+        logger.info(des)
+    
+    def get_pipeline(self,
+                     cumulative = False,
+                     max_time   = -1,
+                     time_window    = 5.,
+                     max_frames = -1,
+                     
+                     save   = True,
+                     directory  = None,
+                     
+                     processing_fn  = None,
+                     
+                     playback   = False,
+                     
+                     ** kwargs
+                    ):
+        def _micro_audio_stream(stream):
+            p = pyaudio.PyAudio()
+            inp_stream = p.open(
+                format = pyaudio.paFloat32, channels = 1, rate = self.audio_rate, input = True
+            )
+
+            print('Start recording...')
+            for i in range(max_time // time_window + 1):
+                yield np.frombuffer(inp_stream.read(frames_per_buffer), dtype = np.float32)
+            print('\nStop recording !')
+            inp_stream.close()
+
+        def _file_audio_stream(stream):
+            audio = load_audio(stream, self.audio_rate)
+            
+            end = min(int(max_time * self.audio_rate), len(audio)) if max_time > 0 else len(audio)
+            for i, start in enumerate(range(0, end, frames_per_buffer)):
+                yield audio[start : start + frames_per_buffer]
+
+        def frames_generator(stream, ** kw):
+            def frame_iterator():
+                generator_fn = _file_audio_stream if isinstance(stream, str) else _micro_audio_stream
+                cumulated_audio = None
+                for i, frame in enumerate(generator_fn(stream)):
+                    if cumulative:
+                        cumulated_audio = frame if cumulated_audio is None else np.concatenate(
+                            [cumulated_audio, frame], axis = 0
+                        )
+                    
+                    if not isinstance(frame, dict):
+                        frame = {
+                            'audio' : cumulated_audio if cumulative else frame,
+                            'frame_index'   : i,
+                            'start' : 0 if cumulative else time_window * i,
+                            'end'   : time_window * (i + 1)
+                        }
+                    yield frame
+                yield None
+            
+            generator_fn = _file_audio_stream if isinstance(stream, str) else _micro_audio_stream
+            return (stream, frame_iterator())
+
+        @timer
+        def audio_to_mel(infos, ** kw):
+            if infos is None: return None
+            inputs = tf.expand_dims(self.get_input(infos.pop('audio')), axis = 0)
+            return (infos, inputs)
+
+        @timer
+        def encode(data, ** kw):
+            if data is None: return None
+            
+            infos, inputs = data if not isinstance(data, list) else list(zip(* data))
+            if not isinstance(inputs, (list, tuple)) and max_frames > 0 and tf.shape(inputs)[1] > max_frames:
+                logger.info('Too many frames ({}), truncating to {}'.format(
+                    tf.shape(inputs)[1], max_frames
+                ))
+                inputs = inputs[:, - max_frames :]
+
+            encoder_output = self.encode(inputs, training = False)
+            if isinstance(encoder_output, (list, tuple)): encoder_output = encoder_output[0]
+
+            if isinstance(data, list):
+                return [(info, out) for info, out in zip(infos, encoder_output)]
+            return infos, encoder_output[0]
+
+        @timer
+        def decode(data, last_tokens = None, state = None, ** kw):
+            if data is None:
+                return None, (last_tokens, state)
+
+            infos, encoder_output = data
+            
+            outputs = self.decode(
+                tokens = last_tokens,
+                encoder_output = encoder_output,
+
+                initial_state   = state if not cumulative else None,
+                return_state = True if not cumulative else False,
+                ** kwargs
+            )
+            state = None
+            if not cumulative:
+                if hasattr(outputs, 'state'):
+                    state = outputs.state
+                elif isinstance(outputs, tuple):
+                    outputs, state = outputs
+            
+            tokens = outputs.tokens if hasattr(outputs, 'tokens') else None
+            
+            infos['text'] = self.decode_output(outputs)
+            return infos, (tokens, state)
+
+        @timer
+        def show_output(infos, ** kw):
+            if infos is None:
+                print()
+                return
+            
+            print(infos['text'])
+
+        if processing_fn is None: processing_fn = audio_to_mel
+        
+        frames_per_buffer = int(time_window * self.audio_rate)
+        
+        playback_fn = None
+        if playback:
+            p = pyaudio.PyAudio()
+            out_stream = p.open(
+                format = pyaudio.paFloat32, channels = 1, rate = self.audio_rate, output = True,
+                frames_per_buffer = frames_per_buffer
+            )
+            
+            playback_fn = {
+                'name'  : 'playback',
+                'consumer' : lambda infos, ** kw: out_stream.write(infos['audio'].tobytes()) if infos is not None else None,
+                'allow_multithread' : False,
+                'stop_listeners'    : out_stream.close
+            }
+
+        if directory is None: directory = self.pred_dir
+        
+        pipeline = Pipeline(** {
+            'name'      : 'transcription_pipeline',
+            'filename'  : os.path.join(directory, 'map.json') if save else None,
+            
+            'tasks' : [
+                {
+                    'consumer' : frames_generator, 'splitter' : True, 'consumers' : playback_fn
+                },
+                processing_fn,
+                encode,
+                {
+                    'consumer'  : decode,
+                    'stateful'  : True,
+                    'consumers' : show_output
+                },
+                {'consumer' : 'grouper', 'nested_group' : False}
+            ],
+            ** kwargs
+        })
+        pipeline.start()
+        return pipeline
     
     @timer
     def predict(self,
@@ -407,7 +590,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                     filename = 'audio_{}.wav'.format(len(os.listdir(audio_dir)))
                     write_audio(audio = audio, filename = filename, rate = self.audio_rate)
             
-            logging.info("Processing file {}...".format(filename))
+            logger.info("Processing file {}...".format(filename))
             
             audio_time = int(len(audio) / self.audio_rate)
             if alignment is None:
@@ -468,7 +651,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         try:
             import sounddevice as sd
         except ImportError as e:
-            logging.error('You must install `sounddevice` : `pip install sounddevice`')
+            logger.error('You must install `sounddevice` : `pip install sounddevice`')
             return None
         
         t0 = time.time()

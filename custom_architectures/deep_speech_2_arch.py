@@ -17,6 +17,8 @@ import tensorflow as tf
 
 from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
+logger  = logging.getLogger(__name__)
+
 def DeepSpeech2(input_shape,
                 vocab_size,
                 is_mixed_precision  = False,
@@ -129,7 +131,7 @@ def maybe_download_from_bucket(bucket_name: str, remote_path: str, local_path: s
         return
     directory = os.path.dirname(local_path)
     os.makedirs(directory, exist_ok=True)
-    logging.info('Downloading file from the bucket...')
+    logger.info('Downloading file from the bucket...')
     download_from_bucket(bucket_name, remote_path, local_path)
 
 custom_functions    = {

@@ -732,3 +732,6 @@ custom_objects  = {
     'MultiHeadAttention'    : MultiHeadAttention,
     'FeedForwardNetwork'    : FeedForwardNetwork
 }
+
+_encoders   = {'conformer' : ConformerEncoder}
+_transformers   = {'Conformer' : ConformerTransducer}

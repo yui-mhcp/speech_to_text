@@ -192,7 +192,7 @@ class MAGEncoder(BartEncoder):
     
     def _maybe_init_subsampling_layer(self):
         if self.subsampling_layer is None or self.subsampling_mode != 'dense': return
-        
+
         w = np.zeros(self.subsampling_layer.weights[0].shape)
         for i in range(self.embedding_dim):
             w[i::self.embedding_dim, i] = 1
@@ -623,7 +623,7 @@ class MAGEncoder(BartEncoder):
             as_dict = as_dict
         )
     
-class MAG(Bart):
+class MAGOld(Bart):
     encoder_class   = MAGEncoder
     default_params  = HParamsMAG
     
@@ -647,7 +647,7 @@ class MAG(Bart):
         self.encoder._maybe_init_subsampling_layer()
 
 custom_objects  = {
-    'MAG'   : MAG
+    'MAGOld'   : MAGOld
 }
 
 custom_functions    = custom_objects

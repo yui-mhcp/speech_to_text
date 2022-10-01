@@ -3,28 +3,36 @@
 ## Project structure
 
 ```bash
-├── custom_architectures/   : custom architectures
-├── custom_layers/          : custom layers
-├── custom_train_objects/   : custom objects for training
-│   ├── callbacks/          : custom callbacks
-│   ├── generators/         : custom data generators
-│   ├── losses/             : custom losses
-│   ├── optimizers/         : custom optimizers / lr schedulers
-├── datasets/               : utilities for dataset loading / processing
-│   ├── custom_datasets/    : where to save custom datasets processing
-├── hparams/                : utility class to define modulable hyper-parameters
-├── loggers/                : some logging utilities
-├── models/                 : main `BaseModel` subclasses directory
-│   ├── stt/                : directory for Speech-To-Text models
-├── pretrained_models/      : saving directory for pretrained models
-├── unitest/                : custom unitest framework to test models' consistency
-└── utils/                  : utilities for data processing
-
+.
+├── custom_architectures
+│   ├── transformers_arch
+│   │   ├── conformer_arch.py
+│   │   └── transformer_stt_arch.py
+│   ├── deep_speech_2_arch.py
+│   ├── jasper_arch.py
+│   ├── rnnt_arch.py                    : RNN-T abstract architecture class
+│   └── transducer_generation_utils.py  : RNN-T inference script
+├── custom_layers
+├── custom_train_objects
+├── datasets
+├── hparams
+├── loggers
+├── models
+│   ├── stt
+│   │   ├── base_stt.py             : abstract class for STT models
+│   │   ├── conformer_transducer.py : Conformer Transducer main class
+│   │   ├── deep_speech.py          : Deep Speech 2 main class
+│   │   ├── jasper.py               : Jasper main class
+│   │   └── transformer_stt.py      : Transformer STT main class
+├── pretrained_models
+│   └── pretrained_weights          : where to put the jasper / deep speech pretrained weights
+├── unitest
+├── utils
+├── example_training.ipynb
+└── speech_to_text.ipynb
 ```
 
-See [my data_processing repo](https://github.com/yui-mhcp/data_processing) for more information on the `utils` module and `data processing` features.
-
-See [my base project](https://github.com/yui-mhcp/base_dl_project) for more information on the `BaseModel` class, supported datasets, project extension, ...
+Check [the main project](https://github.com/yui-mhcp/base_dl_project) for more information about the unextended modules / structure / main classes. 
 
 ## Available features
 
@@ -38,7 +46,7 @@ See [my base project](https://github.com/yui-mhcp/base_dl_project) for more info
 
 You can check the `speech_to_text` notebook for a concrete demonstration
 
-**Note** : models are not performant enough for real *transcription / subtitles generation* but the search feature works quite well. The `Conformer-Transducers` models tend to be good enough for transcription but it is currently an experimental feature which will be improved.
+**Note** : models are not performant enough for real *transcription / subtitles generation* but the search feature works quite well. The `Conformer-Transducers` models tend to be good enough for transcription but it is currently an experimental feature which will be improved (by fine-tuning them or adding the Beam Search inference).
 
 ## Available models
 
@@ -56,10 +64,10 @@ Available architectures :
 
 ### Model weights
 
-| Classes   | Dataset   | Architecture  | Trainer   | Weights   |
+| Language  | Dataset   | Architecture  | Trainer   | Weights   |
 | :-------: | :-------: | :-----------: | :-------: | :-------: |
 | `en`      | `LibriSpeech` | `Jasper`  | [NVIDIA](https://github.com/NVIDIA)   | [Google Drive](https://drive.google.com/file/d/1JViFiy-JZ8VYTlaZPVDMZfg0qWcY5-U8/view?usp=sharing)\*  |
-| `fr`      | `SIWIS`, `VoxForge`, `Common Voice`   | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1R9lXaEj4etAyyfy7r3tYNnO5FPwQ7RXS/view?usp=sharing)  |
+| `fr`      | `SIWIS`, `VoxForge`, `Common Voice`   | `Jasper`  | [me](https://github.com/yui-mhcp) | [Google Drive](https://drive.google.com/file/d/1R9lXaEj4etAyyfy7r3tYNnO5FPwQ7RXS/view?usp=sharing)  |
 | `en`      | Many datasets | `ConformerTransducer` | [NVIDIA](https://github.com/NVIDIA) | [Google Drive](https://drive.google.com/file/d/1OpWBvkERK9IVQ1BZPsBHOs46tWn_H2mZ/view?usp=sharing)  |
 | `fr`      | Many datasets | `ConformerTransducer` | [NVIDIA](https://github.com/NVIDIA) | [Google Drive](https://drive.google.com/file/d/1cftQBZEmKL-2fLKpmboWTXIvgFgccsPf/view?usp=sharing)  |
 
@@ -70,7 +78,7 @@ Available architectures :
 
 Models must be unzipped in the `pretrained_models/` directory !
 
-\* This file is a `.h5` weights file. You have to put it in `pretrained_models/pretrained_weights/` folder and call `Jasper.build_from_pretrained_jasper()` method to build the `Jasper` class with pretrained weights ! You can simply execute the cell in `example_training` notebook ;)
+\* This file is a `.h5` weights file. You have to put it in `pretrained_models/pretrained_weights/` folder and check the code in `example_training` notebook ;)
 
 ## Installation and usage
 
@@ -91,7 +99,9 @@ Models must be unzipped in the `pretrained_models/` directory !
 - [x] Implement a `RNN-T` based STT model (such as `Conformer Transducer`)
 - [ ] Add `producer-consumer` based inference
 - [x] Add `producer-consumer` based streaming (currently only for `conformer-transducer`)
-- [x] Add streaming support
+- [x] Add streaming support (experimental)
+- [ ] Add Beam Search inference for RNN-T models
+- [ ] Add pipeline-based prediction
 
 ## Search and partial alignment
 
@@ -128,7 +138,9 @@ The objective is now to align *cat* at all position of `truth` (*the ct*). For t
 
 With this simple trick, you can see that *cat* has a distance of 1 when the alignment is finishing at the last index of `truth` ! It is how the search is implemented so you can see 1 error out of 3 caracters which will give a probability of 66%.
 
-Note : as you can see, score will be less influenced (so more pertinent) if the searched word is longer. 
+Note : as you can see, scores will be less influenced (so more pertinent) if the searched word is longer. 
+
+There is an example in the `speech_to_text` notebook to better illustrate how search works.
 
 ## Contacts and licence
 
