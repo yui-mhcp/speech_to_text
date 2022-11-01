@@ -15,8 +15,6 @@ import logging
 import numpy as np
 import tensorflow as tf
 
-from tensorflow.keras.mixed_precision import experimental as mixed_precision
-
 logger  = logging.getLogger(__name__)
 
 def DeepSpeech2(input_shape,
@@ -35,6 +33,7 @@ def DeepSpeech2(input_shape,
         return tf.reshape(x, [tf.shape(x)[0], tf.shape(x)[1], input_shape[-1] // 4 * 32])
     
     if is_mixed_precision:
+        from tensorflow.keras.mixed_precision import experimental as mixed_precision
         policy = mixed_precision.Policy('mixed_float16')
         mixed_precision.set_policy(policy)
 

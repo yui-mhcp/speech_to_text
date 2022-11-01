@@ -14,7 +14,6 @@ import os
 import tensorflow as tf
 
 from tensorflow.keras.layers import *
-from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
 from custom_architectures.current_blocks import _get_var, Conv1DBN
 from custom_layers import get_activation, LogSoftmax
@@ -113,6 +112,7 @@ def Jasper(input_shape,
            name  = 'Jasper'
           ):
     if use_mixed_precision:
+        from tensorflow.keras.mixed_precision import experimental as mixed_precision
         policy = mixed_precision.Policy('mixed_float16')
         mixed_precision.set_policy(policy)
 
