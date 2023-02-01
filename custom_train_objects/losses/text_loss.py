@@ -42,12 +42,9 @@ class TextLoss(tf.keras.losses.Loss):
             )
         
         loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
-
         loss = loss * padding_mask
 
-        loss = tf.reduce_sum(loss, axis = -1) / (tf.cast(target_length, tf.float32) + 1e-6)
-
-        return loss
+        return tf.reduce_sum(loss, axis = -1) / tf.maximum(tf.cast(target_length, tf.float32), 1e-6)
     
     def get_config(self):
         config = super().get_config()

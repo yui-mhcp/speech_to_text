@@ -12,7 +12,6 @@
 
 import tensorflow as tf
 
-from loggers import timer
 from utils.text import TextEncoder
 from utils.audio import DeepSpeechSTFT
 from custom_architectures import get_architecture
@@ -23,15 +22,9 @@ class DeepSpeech(BaseSTT):
     def __init__(self, * args, ** kwargs):
         kwargs.update({
             'audio_format'      : 'mel',
-            'use_ctc_decoder'   : True,
             'architecture_name' : 'deep_speech_2'
         })
         super().__init__(* args, ** kwargs)
-    
-    @timer(name = 'prediction', log_if_root = False)
-    def call(self, inputs, training = False):
-        if isinstance(inputs, (list, tuple)): inputs = inputs[0]
-        return super().call(inputs, training = training)
 
     @classmethod
     def from_deep_speech_pretrained(cls, 

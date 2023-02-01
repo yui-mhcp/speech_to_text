@@ -23,7 +23,7 @@ from utils.thread_utils import Pipeline
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_audio_model import BaseAudioModel
 from utils import dump_json, load_json, normalize_filename, pad_batch
-from utils.audio import write_audio, load_audio, AudioAnnotation, AudioSearch, SearchResult
+from utils.audio import write_audio, load_audio, display_audio, AudioAnnotation, AudioSearch, SearchResult
 from utils.text import get_encoder, get_symbols, accent_replacement_matrix, decode
 
 logger      = logging.getLogger(__name__)
@@ -40,30 +40,29 @@ DEFAULT_MAX_TEXT_LENGTH = min(256, DEFAULT_MAX_MEL_LENGTH // 2)
 class BaseSTT(BaseTextModel, BaseAudioModel):
     def __init__(self,
                  lang,
-                 use_ctc_decoder,
-                 
                  text_encoder   = None,
                  
                  use_fixed_length_input = False,
                  max_input_length   = DEFAULT_MAX_MEL_LENGTH,
                  max_output_length  = DEFAULT_MAX_TEXT_LENGTH,
                  
+                 use_ctc_decoder    = None,
+                 
                  ** kwargs
                 ):
-        text_encoder = get_encoder(
-            text_encoder = text_encoder,
-            lang    = lang,
-            vocab   = get_symbols(
-                lang, maj = False, arpabet = False, punctuation = 2
-            ),
-            use_sos_and_eos = not use_ctc_decoder
-        )
+        if text_encoder is None:
+            text_encoder = get_encoder(
+                text_encoder = text_encoder,
+                lang    = lang,
+                vocab   = get_symbols(
+                    lang, maj = False, arpabet = False, punctuation = 2
+                ),
+                use_sos_and_eos = self.is_encoder_decoder
+            )
 
         self._init_text(lang = lang, text_encoder = text_encoder, ** kwargs)
         
         self._init_audio(** kwargs)
-        
-        self.use_ctc_decoder    = use_ctc_decoder
         
         self.use_fixed_length_input = use_fixed_length_input
         self.max_input_length   = max_input_length
@@ -81,17 +80,27 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 'architecture_name' : architecture_name,
                 'input_shape'   : self.mel_input_shape,
                 'vocab_size'    : self.vocab_size,
+                'pad_value'     : self.pad_mel_value,
+                'sos_token'     : self.sos_token_idx,
+                'eos_token'     : self.eos_token_idx,
+                'pad_token'     : self.blank_token_idx,
                 ** kwargs
             }
         )
             
     @property
-    def search_dir(self):
-        return os.path.join(self.folder, 'search')
+    def is_encoder_decoder(self):
+        if hasattr(self, 'stt_model'):
+            return hasattr(self.stt_model, 'decoder') and self.stt_model.decoder is not None
+        raise NotImplementedError('You must define `is_encoder_decoder` because it is required before building the model !')
     
     @property
-    def pred_map_file(self):
-        return os.path.join(self.pred_dir, 'map.json')
+    def use_ctc_decoder(self):
+        return not self.is_encoder_decoder
+    
+    @property
+    def search_dir(self):
+        return os.path.join(self.folder, 'search')
     
     @property
     def mel_input_shape(self):
@@ -100,20 +109,13 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     
     @property
     def decoder_method(self):
-        if not self.use_ctc_decoder: return 'greedy'
-        return 'beam_search'
+        return 'greedy' if self.is_encoder_decoder else 'beam'
     
     @property
     def input_signature(self):
-        audio_sign  = (
-            tf.TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = tf.float32),
-            tf.TensorSpec(shape = (None,), dtype = tf.int32)
-        )
+        inp_sign = tf.TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = tf.float32)
         
-        if self.use_ctc_decoder:
-            return audio_sign
-        
-        return audio_sign + self.text_signature
+        return inp_sign if not self.is_encoder_decoder else (inp_sign, self.text_signature)
         
     @property
     def output_signature(self):
@@ -124,60 +126,55 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         return super().training_hparams(
             ** self.training_hparams_audio,
             max_input_length    = None,
-            max_output_length   = None,
+            max_output_length   = None
         )
     
     @property
     def sep_token(self):
         return '-'
     
-    @property
-    def is_encoder_decoder(self):
-        return True if hasattr(self.stt_model, 'decoder') else False
-    
     def __str__(self):
         des = super().__str__()
         des += self._str_text()
         des += self._str_audio()
-        des += "Use CTC decoder : {}\n".format(self.use_ctc_decoder)
+        des += "- Use CTC decoder : {}\n".format(self.use_ctc_decoder)
         return des
     
     @timer(name = 'prediction', log_if_root = False)
-    def call(self, inputs, training = False):
+    def call(self, inputs, training = False, ** kwargs):
         """
             Arguments : 
                 - inputs :
-                    if self.use_ctc_decoder : (mel, mel_length)
-                        - mel           : [B, seq_len, n_mel_channels]
-                        - mel_length    : [B, 1]
-                    else : (mel, mel_length, text, text_length)
-                        - mel           : [B, seq_len, n_mel_channels]
-                        - mel_length    : [B, 1]
-                        - text          : [B, out_seq_len]
-                        - text_length   : [B, 1]
+                    if `self.is_encoder_decoder`:
+                        - audio / mel   : [B, seq_in_len, n_channels]
+                        - text          : [B, seq_out_len]
+                    else :
+                        - audio / mel   : [B, seq_len, n_channels]
             Return :
-                if self.use_ctc_decoder : outputs
-                else : (outputs, attn_weights)
-                
-                    - outputs : [B, out_seq_len, vocab_size] : score for each token at each timestep
+                - outputs   : the score for each token at each timestep
+                    if `self.is_encoder_decoder` :
+                        - shape = [B, sub_seq_len, vocab_size]
+                        Note that `sub_seq_len` may differ from `seq_len` (due to subsampling)
+                    else :
+                        - shape = [B, seq_out_len, vocab_size]
         """
-        return self.stt_model(inputs, training = training)
+        return self.stt_model(inputs, training = training, ** kwargs)
     
     @timer(name = 'inference', log_if_root = False)
-    def infer(self, inputs, training = False, decode = False, ** kwargs):
-        if self.use_ctc_decoder:
-            output = self(inputs, training = training, ** kwargs)
-        else:
+    def infer(self, inputs, training = False, decode = False, prev_tokens = None, ** kwargs):
+        if hasattr(self.stt_model, 'infer'):
             output = self.stt_model.infer(inputs, training = training, ** kwargs)
+        else:
+            output = self(inputs, training = training, ** kwargs)
         
         return self.decode_output(output) if decode else output
     
-    def encode(self, inputs, training = False, ** kwargs):
-        if self.use_ctc_decoder:
-            return self(inputs, training = training, ** kwargs)
-        return self.stt_model.encoder(inputs, training = training, ** kwargs)
+    def encode_audio(self, inputs, training = False, ** kwargs):
+        if self.is_encoder_decoder:
+            return self.stt_model.encoder(inputs, training = training, ** kwargs)
+        return self(inputs, training = training, ** kwargs)
     
-    def decode(self, encoder_output, training = False, return_state = False, ** kwargs):
+    def decode_audio(self, encoder_output, training = False, return_state = False, ** kwargs):
         if len(tf.shape(encoder_output)) == 2:
             encoder_output = tf.expand_dims(encoder_output, axis = 0)
         
@@ -189,18 +186,28 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             ** kwargs
         )
     
-    def compile(self, loss = None, metrics = None, ** kwargs):
+    def compile(self, loss = None, metrics = None, loss_config = {}, ** kwargs):
         if loss is None:
-            loss = 'CTCLoss' if self.use_ctc_decoder else 'TextLoss'
+            loss = 'TextLoss' if self.is_encoder_decoder else 'CTCLoss'
         if metrics is None:
-            if self.use_ctc_decoder:
-                metrics = [{'metric' : 'TextMetric', 'config': {'pad_value' : self.blank_token_idx}}]
-            else:
+            if self.is_encoder_decoder:
                 metrics = ['TextAccuracy']
-            
-        super().compile(loss = loss, metrics = metrics, ** kwargs)
+            else:
+                metrics = [{'metric' : 'TextMetric', 'config': {'pad_value' : self.blank_token_idx}}]
+        
+        loss_config['pad_value'] = self.blank_token_idx
+        super().compile(loss = loss, metrics = metrics, loss_config = loss_config, ** kwargs)
     
     def decode_output(self, output, * args, ** kwargs):
+        if hasattr(output, 'tokens'):
+            if len(tf.shape(output.tokens)) == 3:
+                return [
+                    [self.decode_output(beam[:beam_l]) for beam, beam_l in zip(tokens, length)]
+                    for tokens, length in zip(output.tokens.numpy(), output.lengths.numpy())
+                ]
+            return [
+                self.decode_output(tokens[:l]) for tokens, l in zip(output.tokens, output.lengths)
+            ]
         if len(output.shape) in (1, 2):
             return self.decode_text(output)
         elif len(output.shape) == 3:
@@ -227,102 +234,77 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return self.text_encoder.distance(hypothesis, truth, ** kwargs)
     
-    def get_input(self, data):
-        return self.get_audio(data)
+    def get_input(self, data, pad_or_trim = True):
+        audio = self.get_audio(data)
+        
+        if pad_or_trim:
+            if tf.shape(audio)[0] > self.max_input_length:
+                audio = audio[: self.max_input_length]
+            elif self.use_fixed_length_input and tf.shape(audio)[0] != self.max_input_length:
+                audio = tf.pad(
+                    audio, [(0, self.max_input_length - tf.shape(audio)[0]), (0, 0)],
+                    constant_values = self.pad_mel_value
+                )
+        
+        return audio
     
     def encode_data(self, data):
-        encoded_text = self.tf_encode_text(data)
+        mel  = self.get_input(data)
+        text = self.tf_encode_text(data)
         
-        mel = self.get_input(data)
+        if not self.is_encoder_decoder: return mel, text
         
-        return mel, len(mel), encoded_text, len(encoded_text)
+        if self.text_encoder.use_sos_and_eos:
+            text_in, text_out = text_in[:-1], text_out[1:]
+        
+        return (mel, text_in), text_out
     
-    def filter_data(self, mel, mel_length, text, text_length):
+    def filter_data(self, inputs, output):
+        mel = inputs[0] if isinstance(inputs, tuple) else inputs
         return tf.logical_and(
-            mel_length <= self.max_input_length, 
-            text_length <= self.max_output_length
+            tf.shape(mel)[0] <= self.max_input_length,
+            tf.shape(output)[0] <= self.max_output_length
         )
         
-    def augment_data(self, mel, mel_length, text, text_length):
-        mel = self.augment_audio(mel, max_length = self.max_input_length)
-        
-        return mel, len(mel), text, text_length
-        
-    def preprocess_data(self, mel, mel_length, text, text_length):
-        if self.use_ctc_decoder:
-            return (mel, mel_length), (text, text_length)
-        
-        text_in, text_out = text, text
-        text_in_len, text_out_len   = text_length, text_length
-        if self.text_encoder.use_sos_and_eos:
-            text_in, text_in_len    = text_in[:, :-1], text_in_len - 1
-            text_out, text_out_len  = text_out[:, 1:], text_out_len - 1
-        
-        return (mel, mel_length, text_in, text_in_len), (text_out, text_out_len)
+    def augment_data(self, inputs, output):
+        if not isinstance(inputs, tuple):
+            return self.augment_audio(inputs, max_length = self.max_input_length), output
+
+        mel = self.augment_audio(inputs[0], max_length = self.max_input_length)
+        return (mel, ) + inputs[1:], output
         
     def get_dataset_config(self, ** kwargs):
+        pad_values  = (self.pad_mel_value, self.blank_token_idx)
+        if self.is_encoder_decoder:
+            pad_values = (pad_values, self.blank_token_idx)
+        
         kwargs.update({
             'batch_before_map'  : True,
             'padded_batch'  : True,
-            'pad_kwargs'    : {
-                'padding_values' : (self.pad_mel_value, 0, self.blank_token_idx, 0)
-            }
-            
+            'pad_kwargs'    : {'padding_values' : pad_values}
         })
         if self.use_fixed_length_input:
-            kwargs['pad_kwargs']['padded_shapes'] = (
-                self.mel_input_shape, (), (None,), ()
-            )
+            pad_shapes  = (self.mel_input_shape, (None, ))
+            if self.is_encoder_decoder:
+                pad_shapes = (pad_values, (None, ))
+            kwargs['pad_kwargs']['padded_shapes'] = pad_shapes
         
         return super().get_dataset_config(** kwargs)
         
-    def train_step(self, batch):
-        inputs, target = batch
-        
-        with tf.GradientTape() as tape:
-            pred = self(inputs, training = True)
-            if isinstance(pred, tuple): pred, _ = pred
-            
-            loss = self.stt_model_loss(target, pred)
-        
-        variables = self.stt_model.trainable_variables
-
-        grads = tape.gradient(loss, variables)
-        self.stt_model_optimizer.apply_gradients(zip(grads, variables))
-        
-        return self.update_metrics(target, pred)
-        
-    def eval_step(self, batch):
-        inputs, target = batch
-
-        pred = self(inputs, training = False)
-        if isinstance(pred, tuple): pred, _ = pred
-        
-        return self.update_metrics(target, pred)
-    
     def predict_with_target(self, batch, epoch = None, step = None, prefix = None, 
                             directory = None, n_pred = 1):
         inputs, output = batch
         inputs = [inp[:n_pred] for inp in inputs]
-        text, max_length = [out[:n_pred] for out in output]
+        output = [out[:n_pred] for out in output]
         
-        if self.use_ctc_decoder:
-            pred = self(inputs, training = False)
-            pred = self.decode_output(pred)
-            infer = None
-        else:
-            pred = self(inputs, training = False)
+        infer   = None
+        pred    = self.decode_output(self(inputs, training = False))
+        if self.is_encoder_decoder:
             infer = self.infer(
-                inputs[:-2] if not self.use_ctc_decoder else inputs,
-                max_length      = max_length,
-                early_stopping  = False,
-                decode  = True
+                inputs[:-1], early_stopping = False, max_length = tf.shape(output)[1], decode = True
             )
         
-            pred    = self.decode_output(pred)
-            infer   = self.decode_output(infer)
-                
-        target = self.decode_output(text)
+        target = self.decode_output(output)
         
         des = ""
         for i in range(len(target)):
@@ -496,8 +478,9 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 filenames,
                 alignments  = None,
                 time_window = 30,
-                time_step   = 27.5, 
+                time_step   = -1,
                 batch_size  = 8,
+                use_prev    = False,
                 
                 max_err = 3,
                 
@@ -515,8 +498,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             if max_err < 1: max_err = int(max_err * 100.)
             
             text = alignments[0]['text']
+            if isinstance(text, list): text = text[0]
             for i in range(1, len(alignments)):
                 last_text, new_text = alignments[i-1]['text'], alignments[i]['text']
+                if isinstance(last_text, list): last_text = last_text[0]
+                if isinstance(new_text, list): new_text = new_text[0]
                 
                 overlap = alignments[i]['start'] - alignments[i-1]['end']
                 if overlap <= 0:
@@ -550,6 +536,15 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             return text
             
         # Normalize variables
+        def _get_frame(time):
+            if time == 0: return 0
+            n_samples   = int(time * self.audio_rate)
+            return n_samples if self.mel_fn is None else self.mel_fn.get_length(n_samples)
+        
+        if not self.is_encoder_decoder: use_prev = False
+        if time_step == -1: time_step = time_window
+        if use_prev: batch_size = 1
+        
         filenames = normalize_filename(filenames, invalid_mode = 'keep')
         
         if not isinstance(filenames, (list, tuple)):
@@ -562,9 +557,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         audio_dir   = os.path.join(directory, 'audios')
         if save: os.makedirs(audio_dir, exist_ok = True)
         
-        all_outputs = {}
-        if os.path.exists(map_file):
-            all_outputs = load_json(map_file)
+        all_outputs = load_json(map_file, default = {})
         
         outputs = []
         for i, filename in enumerate(filenames):
@@ -602,30 +595,33 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             
             time_logger.start_timer('processing')
             # Slice audio by step with part of length `window` (and remove part < 0.1 sec)
-            inputs = [audio[
-                int(info['start'] * self.audio_rate) : int(info['end'] * self.audio_rate)
-            ] for info in alignment]
-            inputs = [
-                self.get_audio(a) for a in inputs if len(a) > self.audio_rate * MIN_AUDIO_TIME
+            audio   = self.get_input(audio, pad_or_trim = False)
+            
+            inputs  = [
+                audio[_get_frame(info['start']) : _get_frame(info['end'])] for info in alignment
             ]
+            inputs  = [inp for inp in inputs if len(inputs) > 0]
+            
             time_logger.stop_timer('processing')
             
             # Get text result 
-            text_outputs = []
+            text_outputs, prev_tokens = [], None
             for b in tqdm(range(0, len(inputs), batch_size)):
-                mels    = inputs[b : b + batch_size]
-                length  = tf.cast([len(mel) for mel in mels], tf.int32)
+                batch   = tf.cast(
+                    pad_batch(inputs[b : b + batch_size], pad_value = self.pad_mel_value), tf.float32
+                )
                 
-                batch   = [pad_batch(mels, pad_value = self.pad_mel_value), length]
-                pred    = self.infer(batch, decode = True)
-                if isinstance(pred, tuple): pred, _ = pred
+                pred    = self.infer(batch, decode = False, prev_tokens = prev_tokens, ** kwargs)
+                if use_prev: prev_tokens = pred.tokens if hasattr(pred, 'tokens') else pred
                 
-                text_outputs += pred
+                text_outputs += self.decode_output(pred)
             
             for info, text in zip(alignment, text_outputs):
+                if isinstance(text, str): text = text.strip()
+                elif isinstance(text, list): text = [t.strip() for t in text]
                 info.setdefault('id', -1)
                 info.update({
-                    'text'  : text.strip(),
+                    'text'  : text,
                     'time'  : info['end'] - info['start']
                 })
             
@@ -647,7 +643,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         return outputs
     
     @timer
-    def stream(self, max_time = 30, filename = None):
+    def stream(self, max_time = 30, filename = None, ** kwargs):
         try:
             import sounddevice as sd
         except ImportError as e:
@@ -667,8 +663,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         audio = np.reshape(audio, [-1])[2000:int(t1 * self.audio_rate)]
         audio = audio / np.max(np.abs(audio))
 
-        pred = self.infer(audio, decode = True)
-        text = pred[0] if self.use_ctc_decoder else pred[0][0]
+        text = self.infer(self.get_input(audio, pad_or_trim = False), decode = True, ** kwargs)[0]
         
         _ = display_audio(audio, rate = self.audio_rate)
 
@@ -693,7 +688,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         config.update({
             ** self.get_config_audio(),
             ** self.get_config_text(),
-            'use_ctc_decoder'   : self.use_ctc_decoder,
             
             'use_fixed_length_input'    : self.use_fixed_length_input,
             'max_input_length'  : self.max_input_length,

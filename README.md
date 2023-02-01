@@ -1,5 +1,7 @@
 # :yum: Speech To Text (STT)
 
+**NEW : [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file ! Check it to have a global overview of the latest modifications !** :yum:
+
 ## Project structure
 
 ```bash
@@ -23,7 +25,8 @@
 │   │   ├── conformer_transducer.py : Conformer Transducer main class
 │   │   ├── deep_speech.py          : Deep Speech 2 main class
 │   │   ├── jasper.py               : Jasper main class
-│   │   └── transformer_stt.py      : Transformer STT main class
+│   │   ├── transformer_stt.py      : Transformer STT main class
+│   │   └── whisper.py              : Whisper main class
 ├── pretrained_models
 │   └── pretrained_weights          : where to put the jasper / deep speech pretrained weights
 ├── unitest
@@ -61,6 +64,7 @@ Available architectures :
     - [Speech Transformer](https://ieeexplore.ieee.org/document/8462506)
     - [RNN Transducer (RNN-T)](https://www.arxiv-vanity.com/papers/1911.01629/)
     - [Conformer Transducer](https://www.arxiv-vanity.com/papers/1911.01629/) : `RNN-T` based model with the `Conformer` architecture as encoder.
+    - [Whisper](https://github.com/openai/whisper) : OpenAI's Whisper multilingual STT model.
 
 ### Model weights
 
@@ -94,14 +98,15 @@ Models must be unzipped in the `pretrained_models/` directory !
 - [x] Add support for pretrained `DeepSpeech2`
 - [x] Add support for pretrained `Jasper` (from [NVIDIA's official repository](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/SpeechRecognition/Jasper))
 - [x] Add Beam-Search decoding (for acoustic models)
-- [ ] Add new languages support
+- [x] Add multilingual model support (`Whisper`)
 - [x] Implement `Transformer`-based STT models (such as `TransformerSTT` and `Conformer`) (in progress)
 - [x] Implement a `RNN-T` based STT model (such as `Conformer Transducer`)
-- [ ] Add `producer-consumer` based inference
+- [x] Add `producer-consumer` based inference
 - [x] Add `producer-consumer` based streaming (currently only for `conformer-transducer`)
 - [x] Add streaming support (experimental)
 - [ ] Add Beam Search inference for RNN-T models
 - [ ] Add pipeline-based prediction
+- [ ] Try to fix the small difference in output scores between the original pytorch whisper model and my tensorflow implementation (the difference seems to come from the `Conv` functions which differ between pytorch and tensorflow)
 
 ## Search and partial alignment
 
@@ -173,6 +178,7 @@ Github :
 - [NVIDIA's project](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/SpeechRecognition/Jasper) : repository where pretrained weights come from (I converted pytorch checkpoint to tensorflow checkpoint using my `weights_converter` script).
 - [NVIDIA's NeMo project](https://github.com/NVIDIA/NeMo) : the Conformer and the RNN-T implementations are inspired from this github (but converted to tensorflow).
 - [Automatic Speech Recognition project](https://github.com/rolczynski/Automatic-Speech-Recognition) : project where pretrained DeepSpeech2 weights come from. 
+- [OpenAI's Whisper](https://github.com/openai/whisper) : the official OpenAI's implementation of Whisper (in pytorch).
 
 Papers :
 - [1] [Deep Speech 2: End-to-End Speech Recognition in English and Mandarin](https://www.paperswithcode.com/paper/deep-speech-2-end-to-end-speech-recognition) : original DeepSpeech2 paper

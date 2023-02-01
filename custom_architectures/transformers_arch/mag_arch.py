@@ -17,7 +17,7 @@ from loggers import timer
 from utils.sequence_utils import pad_to_multiple
 from custom_layers import FasterEmbedding
 from custom_architectures.transformers_arch.transformer_arch import build_mask, format_output
-from custom_architectures.transformers_arch.bart_arch import Bart, BartEncoder, HParamsBart
+from custom_architectures.transformers_arch.bart_arch import Bart, BartEncoder
 from custom_architectures.transformers_arch.text_transformer_arch import *
 
 _supported_subsamplings = ('select', 'mean', 'max', 'min', 'dense', 'conv', 'separable')
@@ -35,10 +35,6 @@ HParamsMAGEncoder = HParamsTextTransformerEncoder(
     use_type_embedding      = False,
     random_training_type    = True,
     max_types   = 16
-)
-
-HParamsMAG  = HParamsBart(
-    ** HParamsMAGEncoder.get_config(add_prefix = 'encoder')
 )
 
 @timer
@@ -625,7 +621,6 @@ class MAGEncoder(BartEncoder):
     
 class MAGOld(Bart):
     encoder_class   = MAGEncoder
-    default_params  = HParamsMAG
     
     @property
     def dummy_inputs(self):

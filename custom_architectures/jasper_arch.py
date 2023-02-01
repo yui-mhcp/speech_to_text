@@ -13,83 +13,106 @@
 import os
 import tensorflow as tf
 
-from tensorflow.keras.layers import *
-
-from custom_architectures.current_blocks import _get_var, Conv1DBN
-from custom_layers import get_activation, LogSoftmax
+from custom_architectures.current_blocks import _get_var, Conv1DBN, MaskedConv1DBN
+from custom_layers import get_activation, LogSoftmax, MaskedConv1D
 
 _pretrained_weights_file = os.path.join(
     'pretrained_models', 'pretrained_weights', 'pretrained_jasper.h5'
 )
-    
+
 def JasperBlock(inputs,
                 filters,
+                use_mask,
                 repeat      = 3,
                 kernel_size     = 11,
                 strides     = 1,
-                bias        = False,
+                use_bias    = False,
                 dilation    = 1,
                 padding     = 'same',
-                dropout     = 0.2,
-                activation  = None, 
+                
+                drop_rate   = 0.2,
+
+                activation  = None,
+                
                 residual    = True,
                 residual_inputs = [],
-                use_conv_mask   = False,
+
+                pretrained  = False,
                 name        = None
                ):
+    conv_fn = Conv1DBN if not use_mask else MaskedConv1DBN
+    
     if activation is None: activation = tf.keras.layers.ThresholdedReLU(theta = 20.)
     name = '' if name is None else name + '_'
 
     x = inputs
-
     for i in range(repeat):
         activation_i    = activation if i < repeat - 1 else None
-        dropout_i       = dropout if i < repeat-1 else 0.
+        drop_rate_i     = drop_rate if i < repeat-1 else 0.
 
-        x = Conv1DBN(
+        x = conv_fn(
             x,
             filters         = filters,
             kernel_size     = kernel_size,
             strides         = strides,
             dilation_rate   = dilation,
             padding         = padding,
-            use_bias        = bias,
+            use_bias        = use_bias,
             bnorm           = 'after',
             activation      = activation_i,
-            drop_rate       = dropout_i,
+            drop_rate       = drop_rate_i,
             residual        = False,
+            use_mask    = use_mask,
+            use_manual_padding  = use_mask,
+            bn_name         = '{}norm_{}'.format(name, i+1),
             name            = '{}conv_{}'.format(name, i+1)
         )
-        
+    
     if residual:
         if len(residual_inputs) == 0: residual_inputs = [inputs]
         
         residual_outputs = []
         for i, res_input in enumerate(residual_inputs):
-            model = Conv1DBN(
-                tf.keras.Sequential(name = '{}_model_residual_{}'.format(name, i+1)),
-                filters         = filters,
-                kernel_size     = 1,
-                strides         = 1,
-                dilation_rate   = 1,
-                padding         = padding,
-                use_bias        = bias,
-                bnorm           = 'after',
-                activation      = None,
-                drop_rate       = 0.,
-                residual        = False,
-                name            = '{}residual_{}'.format(name, i+1)
-            )
-            out = model(res_input)
-            
-            residual_outputs.append(out)
+            if pretrained:
+                residual_outputs.append(conv_fn(
+                    tf.keras.Sequential(name = '{}_model_residual_{}'.format(name, i+1)),
+                    filters         = filters,
+                    kernel_size     = 1,
+                    strides         = 1,
+                    dilation_rate   = 1,
+                    padding         = padding,
+                    use_bias        = use_bias,
+                    bnorm           = 'after',
+                    activation      = None,
+                    drop_rate       = 0.,
+                    residual        = False,
+                    bn_name         = '{}residual_norm_{}'.format(name, i+1),
+                    name            = '{}residual_{}'.format(name, i+1)
+                )(res_input))
+            else:
+                residual_outputs.append(conv_fn(
+                    res_input,
+                    filters         = filters,
+                    kernel_size     = 1,
+                    strides         = 1,
+                    dilation_rate   = 1,
+                    padding         = padding,
+                    use_bias        = use_bias,
+                    bnorm           = 'after',
+                    activation      = None,
+                    drop_rate       = 0.,
+                    residual        = False,
+                    bn_name         = '{}residual_norm_{}'.format(name, i+1),
+                    name            = '{}residual_{}'.format(name, i+1)
+                ))
         
         x = tf.keras.layers.Add()([x] + residual_outputs)
-        
+    
     if activation is not None:
         x = get_activation('relu')(x)
     
-    if dropout > 0.: x = tf.keras.layers.Dropout(dropout)(x)
+    if drop_rate > 0.: x = tf.keras.layers.Dropout(drop_rate)(x)
+        
         
     return x
         
@@ -102,49 +125,57 @@ def Jasper(input_shape,
            strides       = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] ,
            dilation      = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1] ,
            activation    = 'relu',
-           dropout       = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.3, 0.3, 0.4, 0.4],
+           drop_rate     = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.3, 0.3, 0.4, 0.4],
            residual      = [False, True, True, True, True, True, True, True, True, True, True, False, False],
            residual_dense    = [False, True, True, True, True, True, True, True, True, True, True, False, False],
            last_activation   = 'log_softmax',
+           
            use_mixed_precision  = False,
            pretrained           = False,
            pretrained_file      = _pretrained_weights_file,
-           name  = 'Jasper'
+           
+           pad_value    = None,
+           name  = 'Jasper',
+           
+           ** kwargs
           ):
+    use_mask    = pad_value is not None
+    last_conv_fn    = MaskedConv1D if use_mask else tf.keras.layers.Conv1D
     if use_mixed_precision:
         from tensorflow.keras.mixed_precision import experimental as mixed_precision
         policy = mixed_precision.Policy('mixed_float16')
         mixed_precision.set_policy(policy)
-
+    
     inputs = tf.keras.layers.Input(shape = input_shape, name = 'mel_input')
     
-    x = inputs
+    x = inputs if not use_mask else tf.keras.layers.Masking(mask_value = pad_value)(inputs)
     res = []
     for i in range(n_block):
         if _get_var(residual_dense, i): res.append(x)
         x = JasperBlock(
             x,
+            use_mask    = use_mask,
             repeat      = _get_var(repeat, i),
             filters     = _get_var(filters, i),
             kernel_size = _get_var(kernel_size, i),
             strides     = _get_var(strides, i),
             dilation    = _get_var(dilation, i),
             activation  = _get_var(activation, i),
-            dropout     = _get_var(dropout, i),
+            drop_rate   = _get_var(drop_rate, i),
             residual    = _get_var(residual, i),
             residual_inputs = res,
+            pretrained  = pretrained,
             name        = "block_{}".format(i+1)
         )
 
-    out = tf.keras.layers.Conv1D(
-        filters = vocab_size, kernel_size = 1, activation = None, name = 'output_layer'
+    out = last_conv_fn(
+        filters = vocab_size, kernel_size = 1, padding = 'same', activation = None, name = 'output_layer'
     )(x)
     out = get_activation(last_activation)(out)
     
     model = tf.keras.Model(inputs, out, name = name)
     
-    if pretrained:
-        model.load_weights(pretrained_file)
+    if pretrained: model.load_weights(pretrained_file)
     
     return model
 
@@ -154,5 +185,5 @@ custom_functions    = {
 
 custom_objects  = {
     "log_softmax"   : LogSoftmax,
-    "LogSoftmax"    : LogSoftmax,
+    "LogSoftmax"    : LogSoftmax
 }

@@ -12,28 +12,20 @@
 
 import tensorflow as tf
 
-from loggers import timer
 from utils.audio import JasperSTFT
 from utils.text import TextEncoder
 from custom_architectures import get_architecture
-from models.weights_converter import partial_transfer_learning
+from models.weights_converter import name_based_partial_transfer_learning
 from models.stt.base_stt import BaseSTT, _deep_speech_en_symbols
 
 class Jasper(BaseSTT):
     def __init__(self, * args, ** kwargs):
         kwargs.update({
             'audio_format'      : 'mel',
-            'use_ctc_decoder'   : True,
             'architecture_name' : 'jasper'
         })
         super().__init__(* args, ** kwargs)
 
-    @timer(name = 'prediction', log_if_root = False)
-    def call(self, inputs, training = False):
-        if isinstance(inputs, (list, tuple)): inputs = inputs[0]
-        return super().call(inputs, training = training)
-
-    
     @classmethod
     def from_jasper_pretrained(cls, 
                                nom     = 'pretrained_jasper',
@@ -76,7 +68,9 @@ class Jasper(BaseSTT):
                 'Jasper', input_shape = (None, 64), vocab_size = 29, pretrained = True
             )
         
-        partial_transfer_learning(instance.stt_model, pretrained_model)
+        name_based_partial_transfer_learning(
+            instance.stt_model, pretrained_model, skip_root = False
+        )
         
         instance.save()
         

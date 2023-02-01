@@ -42,11 +42,6 @@ HParamsTransformerSTTEncoder    = HParamsTransformerEncoder(
     scale_embedding = False
 )
 
-HParamsTransformerSTT   = HParamsTextTransformer(
-    ** HParamsTransformerSTTEncoder.get_config(add_prefix = 'encoder'),
-    ** HParamsBartDecoder.get_config(add_prefix = 'decoder')
-)
-
 def _get_var(_vars, i):
     if callable(_vars) and _vars.__class__.__name__ == 'function': return _vars(i)
     elif isinstance(_vars, list): return _vars[i]
@@ -265,7 +260,6 @@ class TransformerSTTEncoder(TransformerBlock):
 class TransformerSTT(TextTransformer):
     encoder_class   = TransformerSTTEncoder
     decoder_class   = BartDecoder
-    default_params  = HParamsTransformerSTT
 
     @classmethod
     def from_pretrained(cls,

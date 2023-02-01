@@ -19,6 +19,7 @@ from models.stt.jasper import Jasper
 from models.stt.deep_speech import DeepSpeech
 from models.stt.transformer_stt import TransformerSTT
 from models.stt.conformer_transducer import ConformerTransducer
+from models.stt.whisper import Whisper
 
 def get_model_lang(model):
     return get_model_config(model).get('lang', None)
@@ -56,6 +57,7 @@ _pretrained = {
 _models = {
     'BaseSTT'   : BaseSTT,
     'Jasper'    : Jasper,
+    'Whisper'   : Whisper,
     'DeepSpeech'    : DeepSpeech,
     'TransformerSTT'    : TransformerSTT,
     'ConformerTransducer'   : ConformerTransducer
