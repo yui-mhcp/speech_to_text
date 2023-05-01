@@ -234,7 +234,7 @@ class RNNT(tf.keras.Model):
     def get_initial_state(self, inputs):
         return self.decoder.get_initial_state(inputs)
 
-    @tf.function(experimental_relax_shapes = True)
+    @tf.function(reduce_retracing = True)
     def decode(self,
                inputs,
                input_length,

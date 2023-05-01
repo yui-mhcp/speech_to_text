@@ -197,7 +197,7 @@ class WhisperDecoder(GPT2):
             self, pretrained, skip_root = False, patterns = {
                 ** _transformer_patterns, 'blocks/' : 'layer_', '_ln' : '_norm',
                 'ffn/0' : 'ffn/dense_1', 'ffn/2' : 'ffn/dense_2',
-                '(attn|mha)_norm' : 'mha/norm_input', 'cross_' : 'enc_'
+                '(attn|mha)_norm' : 'mha/norm_input', 'cross_' : 'enc_', 'enc_attn' : 'enc_mha'
             }, ** kwargs
         )
         
