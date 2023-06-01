@@ -50,8 +50,8 @@ def predict(audios, lang = None, model = None, ** kwargs):
 
 
 _pretrained = {
-    'en'    : 'stt_en_conformer_transducer_medium',
-    'fr'    : 'stt_fr_conformer_transducer_large'
+    'en'    : 'whisper',
+    'fr'    : 'whisper'
 }
 
 _models = {

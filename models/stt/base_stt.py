@@ -238,13 +238,18 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         audio = self.get_audio(data)
         
         if pad_or_trim:
-            if tf.shape(audio)[0] > self.max_input_length:
-                audio = audio[: self.max_input_length]
-            elif self.use_fixed_length_input and tf.shape(audio)[0] != self.max_input_length:
-                audio = tf.pad(
-                    audio, [(0, self.max_input_length - tf.shape(audio)[0]), (0, 0)],
-                    constant_values = self.pad_mel_value
-                )
+            audio = self.pad_or_trim(audio)
+        
+        return audio
+    
+    def pad_or_trim(self, audio):
+        if tf.shape(audio)[0] > self.max_input_length:
+            audio = audio[: self.max_input_length]
+        elif self.use_fixed_length_input and tf.shape(audio)[0] != self.max_input_length:
+            audio = tf.pad(
+                audio, [(0, self.max_input_length - tf.shape(audio)[0]), (0, 0)],
+                constant_values = self.pad_mel_value
+            )
         
         return audio
     
