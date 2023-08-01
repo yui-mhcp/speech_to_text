@@ -13,10 +13,12 @@
 import tensorflow as tf
 
 class TextLoss(tf.keras.losses.Loss):
-    def __init__(self, pad_value = 0, name = 'TextLoss', ** kwargs):
+    def __init__(self, pad_value = 0, from_logits = False, name = 'TextLoss', ** kwargs):
         kwargs['reduction'] = tf.keras.losses.Reduction.NONE
         super().__init__(name = name, ** kwargs)
-        self.pad_value = pad_value
+        
+        self.pad_value  = pad_value
+        self.from_logits    = from_logits
         
     def call(self, y_true, y_pred):
         skip_length = 0
@@ -41,7 +43,9 @@ class TextLoss(tf.keras.losses.Loss):
                 )
             )
         
-        loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+        loss = tf.keras.losses.sparse_categorical_crossentropy(
+            y_true, y_pred, from_logits = self.from_logits
+        )
         loss = loss * padding_mask
 
         return tf.reduce_sum(loss, axis = -1) / tf.maximum(tf.cast(target_length, tf.float32), 1e-6)
@@ -49,4 +53,5 @@ class TextLoss(tf.keras.losses.Loss):
     def get_config(self):
         config = super().get_config()
         config['pad_value']     = self.pad_value
+        config['from_logits']   = self.from_logits
         return config

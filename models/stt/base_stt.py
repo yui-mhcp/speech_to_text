@@ -24,7 +24,7 @@ from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_audio_model import BaseAudioModel
 from utils import dump_json, load_json, normalize_filename, pad_batch
 from utils.audio import write_audio, load_audio, display_audio, AudioAnnotation, AudioSearch, SearchResult
-from utils.text import get_encoder, get_symbols, accent_replacement_matrix, decode
+from utils.text import get_encoder, get_symbols, accent_replacement_matrix, ctc_decode
 
 logger      = logging.getLogger(__name__)
 time_logger = logging.getLogger('timer')
@@ -91,7 +91,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     @property
     def is_encoder_decoder(self):
         if hasattr(self, 'stt_model'):
-            return hasattr(self.stt_model, 'decoder') and self.stt_model.decoder is not None
+            return getattr(self.stt_model, 'decoder', None) is not None
         raise NotImplementedError('You must define `is_encoder_decoder` because it is required before building the model !')
     
     @property
@@ -208,13 +208,10 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             return [
                 self.decode_output(tokens[:l]) for tokens, l in zip(output.tokens, output.lengths)
             ]
+        if self.use_ctc_decoder:
+            return self.text_encoder.ctc_decode(output, blank_idx = self.blank_token_idx, ** kwargs)
         if len(output.shape) in (1, 2):
-            return self.decode_text(output)
-        elif len(output.shape) == 3:
-            pred = decode(
-                output, method = self.decoder_method, blank_idx = self.blank_token_idx, ** kwargs
-            )
-            return [self.decode_output(p) for p in pred]
+            return self.decode_text(output, ** kwargs)
         else:
             raise ValueError("Invalid shape : {}".format(output.shape))
     

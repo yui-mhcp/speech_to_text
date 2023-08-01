@@ -1,6 +1,8 @@
 # :yum: Speech To Text (STT)
 
-**NEW : [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file ! Check it to have a global overview of the latest modifications !** :yum:
+Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications ! :yum:
+
+**IMPORTANT NOTE** : currently, only the `Whisper` models have been refactored. The other architectures (such as `Jasper` and `DeepSpeech`) may not properly work, especially in their `predict` method. 
 
 ## Project structure
 
@@ -49,7 +51,7 @@ Check [the main project](https://github.com/yui-mhcp/base_dl_project) for more i
 
 You can check the `speech_to_text` notebook for a concrete demonstration
 
-**Note** : models are not performant enough for real *transcription / subtitles generation* but the search feature works quite well. The `Conformer-Transducers` models tend to be good enough for transcription but it is currently an experimental feature which will be improved (by fine-tuning them or adding the Beam Search inference).
+**Note** : most models (except `Whisper`) are not performant enough for real *transcription / subtitles generation* but the search feature works quite well. The `Conformer-Transducers` models tend to be good enough for transcription but it is currently an experimental feature which will be improved (by fine-tuning them or adding the Beam Search inference).
 
 ## Available models
 
@@ -78,7 +80,7 @@ Available architectures :
 
 `ConformerTransducer` models come from the [NVIDIA NeMo project](https://github.com/NVIDIA/NeMo) but are converted in tensorflow weights. To re-create them from NeMo, you have to clone the NeMo project and use the `ConformerTransducer.from_nemo_pretrained` method.
 
-**Warning** : `Jasper` model weights are 3Go files !
+**WARNING** : `Jasper` model weights are 3Go files !
 
 Models must be unzipped in the `pretrained_models/` directory !
 
@@ -105,8 +107,9 @@ Models must be unzipped in the `pretrained_models/` directory !
 - [x] Add `producer-consumer` based streaming (currently only for `conformer-transducer`)
 - [x] Add streaming support (experimental)
 - [ ] Add Beam Search inference for RNN-T models
-- [ ] Add pipeline-based prediction
+- [ ] Add pipeline-based prediction for mic streaming
 - [ ] Try to fix the small difference in output scores between the original pytorch whisper model and my tensorflow implementation (the difference seems to come from the `Conv` functions which differ between pytorch and tensorflow)
+- [ ] Convert `Whisper` pretrained models from the `transformers` hub (currently, only the official `Whisper` weights are supported)
 
 ## Search and partial alignment
 
