@@ -14,20 +14,19 @@ import os
 import time
 import logging
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 
 from tqdm import tqdm
 
-from loggers import timer
-from utils.thread_utils import Pipeline
+from loggers import timer, time_logger
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_audio_model import BaseAudioModel
-from utils import dump_json, load_json, normalize_filename, pad_batch
+from utils import dump_json, load_json, normalize_filename, pad_batch, get_filename, should_predict
 from utils.audio import write_audio, load_audio, display_audio, AudioAnnotation, AudioSearch, SearchResult
 from utils.text import get_encoder, get_symbols, accent_replacement_matrix, ctc_decode
 
-logger      = logging.getLogger(__name__)
-time_logger = logging.getLogger('timer')
+logger  = logging.getLogger(__name__)
 
 _silent_char    = list(" '\"")
 _deep_speech_en_symbols = list(" abcdefghijklmnopqrstuvwxyz'") + ['']
@@ -38,6 +37,9 @@ DEFAULT_MAX_MEL_LENGTH  = 1024
 DEFAULT_MAX_TEXT_LENGTH = min(256, DEFAULT_MAX_MEL_LENGTH // 2)
         
 class BaseSTT(BaseTextModel, BaseAudioModel):
+    output_signature    = BaseTextModel.text_signature
+    get_output  = BaseTextModel.tf_encode_text
+    
     def __init__(self,
                  lang,
                  text_encoder   = None,
@@ -61,7 +63,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             )
 
         self._init_text(lang = lang, text_encoder = text_encoder, ** kwargs)
-        
         self._init_audio(** kwargs)
         
         self.use_fixed_length_input = use_fixed_length_input
@@ -92,7 +93,9 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     def is_encoder_decoder(self):
         if hasattr(self, 'stt_model'):
             return getattr(self.stt_model, 'decoder', None) is not None
-        raise NotImplementedError('You must define `is_encoder_decoder` because it is required before building the model !')
+        raise NotImplementedError(
+            'You must define `is_encoder_decoder` because it is required before building the model !'
+        )
     
     @property
     def use_ctc_decoder(self):
@@ -118,20 +121,12 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         return inp_sign if not self.is_encoder_decoder else (inp_sign, self.text_signature)
         
     @property
-    def output_signature(self):
-        return self.text_signature
-        
-    @property
     def training_hparams(self):
         return super().training_hparams(
             ** self.training_hparams_audio,
             max_input_length    = None,
             max_output_length   = None
         )
-    
-    @property
-    def sep_token(self):
-        return '-'
     
     def __str__(self):
         des = super().__str__()
@@ -158,6 +153,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                     else :
                         - shape = [B, seq_out_len, vocab_size]
         """
+        if self.stt_model.__class__.__name__ == 'Functional': kwargs = {}
         return self.stt_model(inputs, training = training, ** kwargs)
     
     @timer(name = 'inference', log_if_root = False)
@@ -199,21 +195,9 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         super().compile(loss = loss, metrics = metrics, loss_config = loss_config, ** kwargs)
     
     def decode_output(self, output, * args, ** kwargs):
-        if hasattr(output, 'tokens'):
-            if len(tf.shape(output.tokens)) == 3:
-                return [
-                    [self.decode_output(beam[:beam_l]) for beam, beam_l in zip(tokens, length)]
-                    for tokens, length in zip(output.tokens.numpy(), output.lengths.numpy())
-                ]
-            return [
-                self.decode_output(tokens[:l]) for tokens, l in zip(output.tokens, output.lengths)
-            ]
         if self.use_ctc_decoder:
-            return self.text_encoder.ctc_decode(output, blank_idx = self.blank_token_idx, ** kwargs)
-        if len(output.shape) in (1, 2):
-            return self.decode_text(output, ** kwargs)
-        else:
-            raise ValueError("Invalid shape : {}".format(output.shape))
+            return self.text_encoder.ctc_decode(output, ** kwargs)
+        return self.decode_text(output, ** kwargs)
     
     @timer
     def distance(self, hypothesis, truth, ** kwargs):
@@ -252,12 +236,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     
     def encode_data(self, data):
         mel  = self.get_input(data)
-        text = self.tf_encode_text(data)
+        text = self.get_output(data)
         
         if not self.is_encoder_decoder: return mel, text
         
-        if self.text_encoder.use_sos_and_eos:
-            text_in, text_out = text_in[:-1], text_out[1:]
+        text_in, text_out = text_in[:-1], text_out[1:]
         
         return (mel, text_in), text_out
     
@@ -315,334 +298,166 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 "" if infer is None else "\n  Inference  : {}".format(infer[i])
             )
         logger.info(des)
-    
-    def get_pipeline(self,
-                     cumulative = False,
-                     max_time   = -1,
-                     time_window    = 5.,
-                     max_frames = -1,
-                     
-                     save   = True,
-                     directory  = None,
-                     
-                     processing_fn  = None,
-                     
-                     playback   = False,
-                     
-                     ** kwargs
-                    ):
-        def _micro_audio_stream(stream):
-            p = pyaudio.PyAudio()
-            inp_stream = p.open(
-                format = pyaudio.paFloat32, channels = 1, rate = self.audio_rate, input = True
+
+    def _add_segment(self, all_segments, segment, start, end, tokens, result, ** kwargs):
+        text    = self.decode_output(tokens) if len(tokens) > 0 else ''
+        if isinstance(text, list): text = text[0]
+        text    = text.strip()
+
+        infos = {
+            "num"   : len(all_segments),
+            "start" : start,
+            "end"   : end,
+            "time"  : end - start,
+            "text"  : text,
+            "tokens"    : tokens,
+            "score"     : result.score[0].numpy() if hasattr(result, 'score') else 0
+        }
+        if text: all_segments.append(infos)
+
+        return post_process(segment, infos, ** kwargs)
+
+    def predict_segment(self, mel, start, end, time_window = 30, ** kwargs):
+        window = self._get_sample_index(time_window)
+        
+        segments = []
+        for i, start in enumerate(range(0, len(mel), window)):
+            pred = self.infer(
+                tf.expand_dims(mel[start : start + window], axis = 0), decode = False, ** kwargs
             )
 
-            print('Start recording...')
-            for i in range(max_time // time_window + 1):
-                yield np.frombuffer(inp_stream.read(frames_per_buffer), dtype = np.float32)
-            print('\nStop recording !')
-            inp_stream.close()
-
-        def _file_audio_stream(stream):
-            audio = load_audio(stream, self.audio_rate)
-            
-            end = min(int(max_time * self.audio_rate), len(audio)) if max_time > 0 else len(audio)
-            for i, start in enumerate(range(0, end, frames_per_buffer)):
-                yield audio[start : start + frames_per_buffer]
-
-        def frames_generator(stream, ** kw):
-            def frame_iterator():
-                generator_fn = _file_audio_stream if isinstance(stream, str) else _micro_audio_stream
-                cumulated_audio = None
-                for i, frame in enumerate(generator_fn(stream)):
-                    if cumulative:
-                        cumulated_audio = frame if cumulated_audio is None else np.concatenate(
-                            [cumulated_audio, frame], axis = 0
-                        )
-                    
-                    if not isinstance(frame, dict):
-                        frame = {
-                            'audio' : cumulated_audio if cumulative else frame,
-                            'frame_index'   : i,
-                            'start' : 0 if cumulative else time_window * i,
-                            'end'   : time_window * (i + 1)
-                        }
-                    yield frame
-                yield None
-            
-            generator_fn = _file_audio_stream if isinstance(stream, str) else _micro_audio_stream
-            return (stream, frame_iterator())
-
-        @timer
-        def audio_to_mel(infos, ** kw):
-            if infos is None: return None
-            inputs = tf.expand_dims(self.get_input(infos.pop('audio')), axis = 0)
-            return (infos, inputs)
-
-        @timer
-        def encode(data, ** kw):
-            if data is None: return None
-            
-            infos, inputs = data if not isinstance(data, list) else list(zip(* data))
-            if not isinstance(inputs, (list, tuple)) and max_frames > 0 and tf.shape(inputs)[1] > max_frames:
-                logger.info('Too many frames ({}), truncating to {}'.format(
-                    tf.shape(inputs)[1], max_frames
-                ))
-                inputs = inputs[:, - max_frames :]
-
-            encoder_output = self.encode(inputs, training = False)
-            if isinstance(encoder_output, (list, tuple)): encoder_output = encoder_output[0]
-
-            if isinstance(data, list):
-                return [(info, out) for info, out in zip(infos, encoder_output)]
-            return infos, encoder_output[0]
-
-        @timer
-        def decode(data, last_tokens = None, state = None, ** kw):
-            if data is None:
-                return None, (last_tokens, state)
-
-            infos, encoder_output = data
-            
-            outputs = self.decode(
-                tokens = last_tokens,
-                encoder_output = encoder_output,
-
-                initial_state   = state if not cumulative else None,
-                return_state = True if not cumulative else False,
+            self._add_segment(
+                segments,
+                segment = mel[start : start + window],
+                start   = time_window * i,
+                end     = time_window * (i + 1),
+                tokens  = pred if not hasattr(pred, 'tokens') else pred.tokens,
+                result  = pred,
                 ** kwargs
             )
-            state = None
-            if not cumulative:
-                if hasattr(outputs, 'state'):
-                    state = outputs.state
-                elif isinstance(outputs, tuple):
-                    outputs, state = outputs
-            
-            tokens = outputs.tokens if hasattr(outputs, 'tokens') else None
-            
-            infos['text'] = self.decode_output(outputs)
-            return infos, (tokens, state)
-
-        @timer
-        def show_output(infos, ** kw):
-            if infos is None:
-                print()
-                return
-            
-            print(infos['text'])
-
-        if processing_fn is None: processing_fn = audio_to_mel
         
-        frames_per_buffer = int(time_window * self.audio_rate)
-        
-        playback_fn = None
-        if playback:
-            p = pyaudio.PyAudio()
-            out_stream = p.open(
-                format = pyaudio.paFloat32, channels = 1, rate = self.audio_rate, output = True,
-                frames_per_buffer = frames_per_buffer
-            )
-            
-            playback_fn = {
-                'name'  : 'playback',
-                'consumer' : lambda infos, ** kw: out_stream.write(infos['audio'].tobytes()) if infos is not None else None,
-                'allow_multithread' : False,
-                'stop_listeners'    : out_stream.close
-            }
-
-        if directory is None: directory = self.pred_dir
-        
-        pipeline = Pipeline(** {
-            'name'      : 'transcription_pipeline',
-            'filename'  : os.path.join(directory, 'map.json') if save else None,
-            
-            'tasks' : [
-                {
-                    'consumer' : frames_generator, 'splitter' : True, 'consumers' : playback_fn
-                },
-                processing_fn,
-                encode,
-                {
-                    'consumer'  : decode,
-                    'stateful'  : True,
-                    'consumers' : show_output
-                },
-                {'consumer' : 'grouper', 'nested_group' : False}
-            ],
-            ** kwargs
-        })
-        pipeline.start()
-        return pipeline
+        return segments
     
     @timer
     def predict(self,
                 filenames,
                 alignments  = None,
-                time_window = 30,
-                time_step   = -1,
-                batch_size  = 8,
-                use_prev    = False,
-                
-                max_err = 3,
                 
                 save    = True,
                 directory   = None,
                 overwrite   = False,
+                timestamp   = -1,
+                raw_audio_dir   = None,
+                raw_audio_filename  = 'audio_{}.mp3',
+
+                condition_on_previous_text  = True,
                 
-                verbose = 1,
-                tqdm    = tqdm,
+                post_processing = None,
+                
+                verbose = False,
                 ** kwargs
                ):
-        @timer(name = 'post processing')
-        def combine_text(alignments, max_err):
-            if len(alignments) == 0: return ''
-            if max_err < 1: max_err = int(max_err * 100.)
-            
-            text = alignments[0]['text']
-            if isinstance(text, list): text = text[0]
-            for i in range(1, len(alignments)):
-                last_text, new_text = alignments[i-1]['text'], alignments[i]['text']
-                if isinstance(last_text, list): last_text = last_text[0]
-                if isinstance(new_text, list): new_text = new_text[0]
-                
-                overlap = alignments[i]['start'] - alignments[i-1]['end']
-                if overlap <= 0:
-                    text += ' ' + new_text
-                    continue
-                
-                prop    = overlap / alignments[i]['time']
-                
-                min_length = int(prop * len(new_text) / 2)
-                max_length = int(prop * len(new_text) * 1.2)
-                
-                best_idx, best_dist, stop = 0, 1, False
-                for j in reversed(range(min_length+1, max_length)):
-                    end, new_end = last_text[-j :], new_text[: j]
-                    
-                    if len(end) != len(new_end) or end[0] != new_end[0]: continue
-                    
-                    dist = self.distance(end, new_end)
-                    max_dist = max_err / j
-                    
-                    if dist < max_dist: stop = True
-                    if dist < max_dist * 2 and dist < best_dist:
-                        best_idx, best_dist = j, dist
-                    
-                    if stop and dist > max_dist: break
+        ####################
+        #  Initialization  #
+        ####################
+        
+        with time_logger.timer('initialization'):
+            if not isinstance(filenames, (list, tuple, pd.DataFrame)): filenames = [filenames]
 
-                mid     = best_idx // 2 if best_idx % 2 != 0 else best_idx // 2 + 1
-                
-                text    = text[: -mid] + ' ' + text[mid :]
+            if directory is None: directory = self.pred_dir
+            raw_audio_dir   = os.path.join(directory, 'audios')
+            map_file    = os.path.join(directory, 'map.json')
 
-            return text
-            
-        # Normalize variables
-        def _get_frame(time):
-            if time == 0: return 0
-            n_samples   = int(time * self.audio_rate)
-            return n_samples if self.mel_fn is None else self.mel_fn.get_length(n_samples)
-        
-        if not self.is_encoder_decoder: use_prev = False
-        if time_step == -1: time_step = time_window
-        if use_prev: batch_size = 1
-        
-        filenames = normalize_filename(filenames, invalid_mode = 'keep')
-        
-        if not isinstance(filenames, (list, tuple)):
-            if alignments is not None: alignments = [alignments]
-            filenames = [filenames]
-        
-        # Define directories
-        if directory is None: directory = self.pred_dir
-        map_file    = os.path.join(directory, 'map.json')
-        audio_dir   = os.path.join(directory, 'audios')
-        if save: os.makedirs(audio_dir, exist_ok = True)
-        
-        all_outputs = load_json(map_file, default = {})
-        
-        outputs = []
-        for i, filename in enumerate(filenames):
-            # Get associated alignment
-            alignment = alignments[i] if alignments is not None else None
-            
-            if isinstance(filename, AudioAnnotation):
-                filename, alignment = filename.filename, filanem._alignment
-            elif isinstance(filename, dict):
-                filename, alignment = filename['filename'], filename.get('alignment', alignment)
-            # Load (or save) audio
-            if isinstance(filename, str):
-                if filename in all_outputs and not overwrite:
-                    outputs.append(all_outputs[filename])
+            predicted = {}
+            if save:
+                os.makedirs(directory, exist_ok = True)
+
+                predicted = load_json(map_file, default = {})
+
+        with time_logger.timer('pre_processing'):
+            results = [None] * len(filenames)
+            duplicatas  = {}
+            requested   = [(
+                get_filename(audio, keys = ('filename', )) if not hasattr(audio, 'filename') else audio.filename,
+                audio
+            ) for audio in filenames]
+
+            inputs = []
+            for i, (file, audio) in enumerate(requested):
+                if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp):
+                    if verbose: logger.info('Audio {} already processed'.format(file))
+                    results[i] = (file, predicted[file])
                     continue
-                
-                time_logger.start_timer('processing')
-                audio = self.get_audio_input(filename)[:, 0]
-                time_logger.stop_timer('processing')
-            else:
-                audio = filename
-                if save:
-                    filename = 'audio_{}.wav'.format(len(os.listdir(audio_dir)))
-                    write_audio(audio = audio, filename = filename, rate = self.audio_rate)
+
+                if isinstance(file, str):
+                    duplicatas.setdefault(file, []).append(i)
+
+                    if len(duplicatas[file]) > 1:
+                        continue
+
+                inputs.append((i, file, audio))
+
+        
+        for idx, file, data in inputs:
+            if isinstance(file, str) and verbose:
+                logger.info('Processing file {}...'.format(file))
+
+            with time_logger.timer('loading audio'):
+                mel = self.get_input(data, pad_or_trim = False)
+
+            # Get associated alignment (if provided)
+            alignment = alignments[idx] if alignments is not None else None
             
-            logger.info("Processing file {}...".format(filename))
+            if isinstance(data, AudioAnnotation):
+                alignment = data._alignment
+            elif isinstance(data, dict):
+                alignment = data.get('alignment', alignment)
+
+            if alignment is None: alignment = [{'id' : -1, 'start' : 0., 'end' : None}]
             
-            audio_time = int(len(audio) / self.audio_rate)
-            if alignment is None:
-                alignment = [{
-                    'start' : t,
-                    'end'   : min(t + time_window, audio_time),
-                    'text'  : ''
-                } for t in np.arange(0, audio_time, time_step)]
-            
-            time_logger.start_timer('processing')
-            # Slice audio by step with part of length `window` (and remove part < 0.1 sec)
-            audio   = self.get_input(audio, pad_or_trim = False)
-            
-            inputs  = [
-                audio[_get_frame(info['start']) : _get_frame(info['end'])] for info in alignment
-            ]
-            inputs  = [inp for inp in inputs if len(inputs) > 0]
-            
-            time_logger.stop_timer('processing')
-            
-            # Get text result 
-            text_outputs, prev_tokens = [], None
-            for b in tqdm(range(0, len(inputs), batch_size)):
-                batch   = tf.cast(
-                    pad_batch(inputs[b : b + batch_size], pad_value = self.pad_mel_value), tf.float32
+            all_segments = []
+            for align in alignment:
+                segments = self.predict_segment(
+                    mel,
+                    verbose = verbose,
+                    post_processing = post_processing,
+                    ** {** kwargs, ** align}
                 )
-                
-                pred    = self.infer(batch, decode = False, prev_tokens = prev_tokens, ** kwargs)
-                if use_prev: prev_tokens = pred.tokens if hasattr(pred, 'tokens') else pred
-                
-                text_outputs += self.decode_output(pred)
+                if isinstance(segments, dict): segments = [segments]
+                for segment in segments:
+                    all_segments.append({** align, ** segment})
+                    all_segments[-1]['start']   += align['start']
+                    all_segments[-1]['end']     += align['start']
             
-            for info, text in zip(alignment, text_outputs):
-                if isinstance(text, str): text = text.strip()
-                elif isinstance(text, list): text = [t.strip() for t in text]
-                info.setdefault('id', -1)
-                info.update({
-                    'text'  : text,
-                    'time'  : info['end'] - info['start']
-                })
-            
-            audio_infos = {
-                'filename'  : filename,
-                'time'      : len(audio) / self.audio_rate,
-                'text'      : combine_text(alignment, max_err),
-                'alignment' : alignment
+            infos = {
+                'filename'  : file,
+                'text'  : ' '.join([seg['text'] for seg in all_segments]),
+                'alignment' : all_segments
             }
-            outputs.append(audio_infos)
             
-            if isinstance(filename, str): all_outputs[filename] = audio_infos
+            if file and file in duplicatas:
+                for idx in duplicatas[file]:
+                    results[idx] = (data, infos)
+            else:
+                results[i] = (data, infos)
+            
+            if save:
+                if not file:
+                    with time_logger.timer('saving audios'):
+                        os.makedirs(raw_audio_dir, exist_ok = True)
+                        file = os.path.join(raw_audio_dir, raw_audio_filename)
+                        if '{}' in file:
+                            file = file.format(len(glob.glob(file.replace('{}', '*'))))
+
+                        write_audio(filename = file, audio = data, rate = self.audio_rate)
+
+                infos['filename']   = file
+                predicted[file]     = infos
+                
+                with time_logger.timer('saving json'):
+                    dump_json(map_file, predicted, indent = 4)
         
-        # Save prediction to map file
-        if save:
-            dump_json(map_file, all_outputs, indent = 4)
-        
-        # Return desired outputs as a list of dict
-        return outputs
+        return results
     
     @timer
     def stream(self, max_time = 30, filename = None, ** kwargs):
@@ -697,3 +512,16 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         })
         
         return config
+def post_process(segment, infos, post_processing = None, verbose = True, ** kwargs):
+    if verbose == 2:
+        logger.info('Add segment from {} to {} with text {}'.format(
+            infos['start'], infos['end'], infos['text']
+        ))
+
+    if post_processing is not None:
+        try:
+            post_processing(segment, infos, ** kwargs)
+        except Exception as e:
+            logger.error('Exception in `post_processing` : {}'.format(e))
+
+    return infos

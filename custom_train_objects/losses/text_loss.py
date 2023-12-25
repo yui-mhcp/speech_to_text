@@ -13,45 +13,72 @@
 import tensorflow as tf
 
 class TextLoss(tf.keras.losses.Loss):
-    def __init__(self, pad_value = 0, from_logits = False, name = 'TextLoss', ** kwargs):
+    def __init__(self,
+                 pad_value  = 0,
+                 eos_value  = -1,
+                 from_logits    = False,
+                 warmup_tokens  = 0,
+                 name = 'TextLoss',
+                 ** kwargs
+                ):
         kwargs['reduction'] = tf.keras.losses.Reduction.NONE
         super().__init__(name = name, ** kwargs)
         
         self.pad_value  = pad_value
+        self.eos_value  = eos_value
+        self.pad_is_eos = pad_value == eos_value
         self.from_logits    = from_logits
+        self.warmup_tokens  = warmup_tokens
+    
+    def build_warmup_mask(self, length, dtype):
+        warmups = tf.cast(tf.range(1, self.warmup_tokens + 1), dtype)
+        warmups = warmups / tf.cast(self.warmup_tokens + 1, dtype)
         
-    def call(self, y_true, y_pred):
-        skip_length = 0
+        return tf.concat([
+            warmups, tf.ones((tf.maximum(0, length - self.warmup_tokens), ), dtype = dtype)
+        ], axis = -1)[tf.newaxis, : length]
+    
+    def compute_padding_mask(self, y_true, target_length, dtype = tf.float32):
+        return tf.sequence_mask(
+            target_length, maxlen = tf.shape(y_true)[1], dtype = dtype
+        )
+
+    def call(self, y_true, y_pred, sample_weight = None, padding_mask = None):
+        if not isinstance(y_pred, tf.Tensor): y_pred = y_pred[0]
+        y_pred._keras_mask = None
+        
+        if isinstance(y_true, tuple) and len(y_true) != 2: y_true = y_true[0]
         if not isinstance(y_true, (list, tuple)):
             target_length = tf.reduce_sum(tf.cast(
                 tf.math.not_equal(y_true, self.pad_value), tf.int32
             ), axis = -1)
+            if self.pad_is_eos: target_length += 1
         else:
-            if len(y_true) == 3: skip_length = y_true[2]
-            y_true, target_length = y_true[:2]
+            y_true, target_length = y_true
 
         if len(tf.shape(y_true)) == 3:
             y_true, target_length = y_true[:, 0], target_length[:, 0]
         
-        padding_mask    = tf.sequence_mask(
-            skip_length + target_length, maxlen = tf.shape(y_pred)[1], dtype = tf.float32
-        )
-        if tf.reduce_any(skip_length > 0):
-            padding_mask    = tf.minimum(
-                padding_mask, 1 - tf.sequence_mask(
-                    skip_length, maxlen = tf.shape(y_pred)[1], dtype = tf.float32
-                )
-            )
-        
-        loss = tf.keras.losses.sparse_categorical_crossentropy(
+        y_pred  = y_pred[:, - tf.shape(y_true)[1] :, :]
+        loss    = tf.keras.losses.sparse_categorical_crossentropy(
             y_true, y_pred, from_logits = self.from_logits
         )
-        loss = loss * padding_mask
 
-        return tf.reduce_sum(loss, axis = -1) / tf.maximum(tf.cast(target_length, tf.float32), 1e-6)
+        #if padding_mask is None:
+        padding_mask = self.compute_padding_mask(y_true, target_length, loss.dtype)
+        
+        loss = loss * padding_mask
+        
+        if self.warmup_tokens > 0:
+            loss = loss * self.build_warmup_mask(tf.shape(loss)[1], loss.dtype)
+        
+        return tf.reduce_sum(loss, axis = -1) / tf.maximum(tf.cast(target_length, loss.dtype), 1e-6)
     
     def get_config(self):
-        config = super().get_config()
-        config['pad_value']     = self.pad_value
-        config['from_logits']   = self.from_logits
-        return config
+        return {
+            ** super().get_config(),
+            'warmup_tokens' : self.warmup_tokens,
+            'from_logits'   : self.from_logits,
+            'eos_value' : self.eos_value,
+            'pad_value' : self.pad_value
+        }

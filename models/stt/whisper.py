@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -11,26 +10,20 @@
 # limitations under the License.
 
 import os
-import glob
 import logging
-import itertools
 import numpy as np
-import pandas as pd
 import tensorflow as tf
 
 from tqdm import tqdm
-from functools import lru_cache
+from functools import cached_property
 
-from loggers import timer
+from utils import load_json, dump_json
+from loggers import timer, time_logger
 from custom_layers import log_softmax
 from models.stt.base_stt import BaseSTT
 from utils.text.text_encoder import WHISPER_LANGUAGES
 from custom_architectures.transformers_arch import whisper_arch
 from utils.text import remove_tokens, remove_batch_tokens, remove_slice_tokens
-from utils.audio.audio_io import read_ffmpeg
-from utils import load_json, dump_json
-
-time_logger = logging.getLogger('timer')
 
 def add_batch_index(indices, batch_size, mask = None):
     if mask is None:
@@ -64,7 +57,7 @@ class Whisper(BaseSTT):
         })
         super().__init__(lang = lang, pretrained = pretrained, ** kwargs)
         
-        self.trim_kwargs['read_method'] = read_ffmpeg
+        self.trim_kwargs['read_method'] = 'read_ffmpeg'
         
         self._lang_to_idx   = {
             v.strip('<|>') : i for i, v in enumerate(self.vocab)
@@ -114,8 +107,7 @@ class Whisper(BaseSTT):
     def timestamp_begin_idx(self):
         return self.vocab_size
     
-    @property
-    @lru_cache()
+    @cached_property
     def languages(self):
         return list(self._lang_to_idx.keys())
 
@@ -139,13 +131,11 @@ class Whisper(BaseSTT):
     def nospeech_token_idx(self):
         return self.text_encoder[self.nospeech_token]
     
-    @property
-    @lru_cache()
+    @cached_property
     def language_indexes(self):
         return list(self._idx_to_lang.keys())
 
-    @property
-    @lru_cache()
+    @cached_property
     def non_speech_token_indexes(self):
         """ Defines non-speech tokens as defined in the original openai/whisper project """
         symbols = list("\"#()*+/:;<=>@[\\]^_`{|}~「」『』")
@@ -175,11 +165,11 @@ class Whisper(BaseSTT):
             '<|notimestamps|>'
         ]
 
-    @property
+    @cached_property
     def special_token_indexes(self):
         return [self.text_encoder[token] for token in self.special_tokens]
 
-    @timer
+    @timer(name = 'language detection')
     @tf.function(reduce_retracing = True)
     def _detect_language(self, mel = None, encoder_output = None, tokens = None, training = False):
         if encoder_output is None: encoder_output = self.stt_model.encoder(mel, training = training)
@@ -201,8 +191,8 @@ class Whisper(BaseSTT):
               prev_tokens   = None,
               ** kwargs
              ):
-        kwargs.setdefault('max_length', self.max_output_length)
-        kwargs.setdefault('logits_filter', self.filter_logits)
+        kwargs.setdefault('max_length',     self.max_output_length)
+        kwargs.setdefault('logits_filter',  self.filter_logits)
         
         if len(tf.shape(inputs)) == 2: inputs = tf.expand_dims(inputs, axis = 0)
 
@@ -212,15 +202,15 @@ class Whisper(BaseSTT):
         
         if len(tf.shape(tokens)) == 1: tokens = tf.expand_dims(tokens, axis = 0)
         
-        if tf.shape(tokens)[0] == 1 and tf.shape(inputs)[0] > 1:
-            tokens = tf.tile(tokens, [tf.shape(inputs)[0], 1])
+        if len(tokens) == 1 and len(inputs) > 1:
+            tokens = tf.tile(tokens, [len(inputs), 1])
         
         if prev_tokens is not None and len(prev_tokens) > 0 and self.start_of_prev_token_idx != -1:
             prev_tokens = tf.cast(prev_tokens, tf.int32)
             if len(tf.shape(prev_tokens)) == 1: prev_tokens = tf.expand_dims(prev_tokens, axis = 0)
             if len(tf.shape(prev_tokens)) == 3: prev_tokens = prev_tokens[:, 0]
             tokens = tf.concat([
-                tf.fill((tf.shape(tokens)[0], 1), self.start_of_prev_token_idx),
+                tf.fill((len(tokens), 1), self.start_of_prev_token_idx),
                 prev_tokens[:, - (kwargs['max_length'] // 2 - 1) :],
                 tokens
             ], axis = -1)
@@ -318,6 +308,8 @@ class Whisper(BaseSTT):
             lambda: self.remove_tokens_with_space,
             lambda: self.remove_tokens
         )
+        if isinstance(tokens, tf.TensorArray):
+            tokens = tf.transpose(tokens.stack()[:t], [1, 0])
         filtered = self.timestamp_filter(scores, tokens, to_remove, t = t)
         filtered.set_shape(scores.shape)
 
@@ -325,16 +317,11 @@ class Whisper(BaseSTT):
     
     @timer
     def detect_language(self, audio):
-        time_logger.start_timer('pre_processing')
-        mel     = self.get_input(audio, pad_or_trim = True)
-        if isinstance(mel, list):
-            mel = tf.cast(pad_batch(mel, pad_value = self.pad_mel_value)) if len(mel) > 1 else mel[0]
-        if len(mel.shape) == 2:
-            mel = tf.expand_dims(mel, axis = 0)
-        
-        tokens  = tf.fill((mel.shape[0], 1), self.sos_token_idx)
-        
-        time_logger.stop_timer('pre_processing')
+        with time_logger.timer('pre_processing'):
+            mel     = self.get_input(audio, pad_or_trim = True)
+            if len(mel.shape) == 2: mel = tf.expand_dims(mel, axis = 0)
+
+            tokens  = tf.fill((mel.shape[0], 1), self.sos_token_idx)
 
         probs   = self._detect_language(mel = mel, tokens = tokens)
         
@@ -343,153 +330,33 @@ class Whisper(BaseSTT):
             {lang : p for lang, p in zip(self.languages, probs_i)}
         ) for probs_i in probs.numpy()]
 
-    @timer
-    def predict(self,
-                filenames,
-                lang = None,
-                
-                save    = True,
-                directory   = None,
-                overwrite   = False,
-                timestamp   = -1,
-                raw_audio_dir   = None,
-                raw_audio_filename  = 'audio_{}.mp3',
+    def predict_segment(self, mel, start = 0, end = None, lang = None, verbose = True, condition_on_previous_text = True, ** kwargs):
+        kwargs['verbose'] = verbose
+        
+        mel = mel[self._get_sample_index(start) : self._get_sample_index(end)]
+        
+        n_frames    = mel.shape[0]
+        segment_duration = float(
+            self.max_input_length * self.mel_fn.hop_length / self.audio_rate
+        )
 
-                condition_on_previous_text  = True,
-                
-                post_processing = None,
-                
-                verbose = False,
-                ** kwargs
-               ):
-        ####################
-        # Helper functions #
-        ####################
-        
-        def post_process(segment, infos):
-            if verbose == 2:
-                print('Add segment from {} to {} with text {}'.format(
-                    infos['start'], infos['end'], infos['text']
-                ))
-            
-            if post_processing is not None:
-                post_processing(segment, infos)
-            
-            return infos
-        
-        @timer
-        def add_segment(segment, start, end, tokens, result):
-            tokens  = [token for token in tokens if token < self.eos_token_idx]
-            text    = self.decode_text(tokens) if tokens else ''
+        seek    = 0
+        prev_seek   = 0
+        input_stride    = self.max_input_length // self.stt_model.encoder.max_input_length
+        time_precision  = float(input_stride * self.mel_fn.hop_length / self.audio_rate)
 
-            infos ={
-                "id"    : -1,
-                "num"   : len(all_segments),
-                "seek"  : seek,
-                "start" : start,
-                "end"   : end,
-                "time"  : end - start,
-                "text"  : text.strip(),
-                "tokens"    : tokens,
-                "score"     : result.score[0].numpy()
-            }
-            if text: all_segments.append(infos)
-            
-            return post_process(segment, infos)
-
-        def should_predict(audio):
-            if isinstance(audio, (dict, pd.Series)) and 'filename' in audio:
-                audio = audio['filename']
-            if isinstance(audio, str) and audio in predicted:
-                if not overwrite or (timestamp != -1 and timestamp <= predicted[audio].get('timestamp', -1)):
-                    return False
-            return True
-        
-        def get_filename(audio):
-            if isinstance(audio, (dict, pd.Series)):
-                audio = audio.get('filename', None)
-            if isinstance(audio, (np.ndarray, tf.Tensor)):
-                return None
-            elif isinstance(audio, str):
-                return audio.replace(os.path.sep, '/')
-            raise ValueError('Unknown audio type ({}) : {}'.format(type(audio), audio))
-
-        ####################
-        #  Initialization  #
-        ####################
-        
-        time_logger.start_timer('initialization')
-        
-        if not isinstance(filenames, (list, tuple, pd.DataFrame)): filenames = [filenames]
-        
-        if directory is None: directory = self.pred_dir
-        raw_audio_dir   = os.path.join(directory, 'audios')
-        map_file    = os.path.join(directory, 'map.json')
-        
-        predicted = {}
-        if save:
-            os.makedirs(directory, exist_ok = True)
-            
-            predicted = load_json(map_file, default = {})
-        
-        
-        results = [None] * len(filenames)
-        duplicatas  = {}
-        requested   = [(get_filename(audio), audio) for audio in filenames]
-        
-        inputs = []
-        for i, (file, audio) in enumerate(requested):
-            if not should_predict(file):
-                if verbose: print('Audio {} already processed'.format(file))
-                results[i] = (file, predicted[file])
-                continue
-            
-            if isinstance(file, str):
-                duplicatas.setdefault(file, []).append(i)
-                
-                if len(duplicatas[file]) > 1:
-                    continue
-            
-            inputs.append((i, file, audio))
-
-        time_logger.stop_timer('initialization')
-        
-        for idx, file, data in inputs:
-            time_logger.start_timer('audio loading')
-            
-            if isinstance(file, str) and verbose:
-                print('Processing file {}...'.format(file))
-            
-            mel = self.get_input(data, pad_or_trim = False)
-
-            n_frames    = mel.shape[0]
-            segment_duration = float(
-                self.max_input_length * self.mel_fn.hop_length / self.audio_rate
-            )
-            
-            seek    = 0
-            input_stride    = self.max_input_length // self.stt_model.encoder.max_input_length
-            time_precision  = float(input_stride * self.mel_fn.hop_length / self.audio_rate)
-
-            time_logger.stop_timer('audio loading')
-
-            seek, all_tokens, all_segments, prev_seek = 0, [], [], 0
-            with tqdm(total = n_frames, unit = 'frames', disable = verbose != 1) as pbar:
-                while seek < n_frames:
-                    time_logger.start_timer('pre_processing')
-                    
+        all_tokens, all_segments = [], []
+        with tqdm(total = n_frames, unit = 'frames', disable = verbose != 1) as pbar:
+            while seek < n_frames:
+                with time_logger.timer('segment processing'):
                     prompt = all_tokens if condition_on_previous_text else None
 
                     segment = self.pad_or_trim(mel[seek :])
 
-                    time_logger.stop_timer('pre_processing')
+                if lang is None: lang = self.detect_language(segment)[0][0]
+                result  = self.infer(segment, prev_tokens = prompt, lang = lang, ** kwargs)
 
-                    if lang is None: lang = self.detect_language(segment)[0][0]
-                    result  = self.infer(segment, prev_tokens = prompt, lang = lang, ** kwargs)
-                    
-                    
-                    time_logger.start_timer('post_processing')
-
+                with time_logger.timer('post_processing'):
                     timestamp_offset = float(seek * self.mel_fn.hop_length / self.audio_rate)
 
                     tokens  = result.tokens[0].numpy()
@@ -508,15 +375,18 @@ class Whisper(BaseSTT):
                             end_timestamp_position = (
                                 sliced_tokens[-1] - self.timestamp_begin_idx
                             )
-                            add_segment(
+                            sliced_tokens = sliced_tokens[1 : -1]
+                            self._add_segment(
+                                all_segments,
                                 segment = segment,
                                 start   = timestamp_offset + start_timestamp_position * time_precision,
                                 end     = timestamp_offset + end_timestamp_position * time_precision,
-                                tokens  = sliced_tokens[1 : -1],
-                                result  = result
+                                tokens  = sliced_tokens[sliced_tokens < self.eos_token_idx],
+                                result  = result,
+                                ** kwargs
                             )
                             last_slice = current_slice
-                        
+
                         last_timestamp_position = (
                             tokens[last_slice - 1] - self.timestamp_begin_idx
                         )
@@ -531,12 +401,14 @@ class Whisper(BaseSTT):
                             last_timestamp_position = timestamps[-1] - self.timestamp_begin_idx
                             duration = float(last_timestamp_position) * time_precision
 
-                        add_segment(
+                        self._add_segment(
+                            all_segments,
                             segment = segment,
                             start   = timestamp_offset,
                             end     = timestamp_offset + duration,
-                            tokens  = tokens,
-                            result  = result
+                            tokens  = tokens[tokens < self.eos_token_idx],
+                            result  = result,
+                            ** kwargs
                         )
 
                         seek += segment.shape[0]
@@ -546,40 +418,4 @@ class Whisper(BaseSTT):
                     pbar.update(min(n_frames, seek) - prev_seek)
                     prev_seek = seek
                     
-                    time_logger.stop_timer('post_processing')
-
-            infos = {
-                'filename'  : file,
-                'text'  : ' '.join([seg['text'] for seg in all_segments]),
-                'lang'  : lang,
-                'alignment' : all_segments
-            }
-            
-            if file and file in duplicatas:
-                for idx in duplicatas[file]:
-                    results[idx] = (data, infos)
-            else:
-                results[i] = (data, infos)
-            
-            if save:
-                if not file:
-                    time_logger.start_timer('saving audios')
-                    
-                    os.makedirs(raw_audio_dir, exist_ok = True)
-                    file = os.path.join(raw_audio_dir, raw_audio_filename)
-                    if '{}' in file:
-                        file = file.format(len(glob.glob(file.replace('{}', '*'))))
-                    
-                    write_audio(filename = file, audio = data, rate = self.audio_rate)
-                    
-                    time_logger.stop_timer('saving audios')
-
-                infos['filename']   = file
-                predicted[file]     = infos
-                
-                time_logger.start_timer('saving json')
-                dump_json(map_file, predicted, indent = 4)
-                time_logger.stop_timer('saving json')
-        
-        return results
-    
+        return all_segments
