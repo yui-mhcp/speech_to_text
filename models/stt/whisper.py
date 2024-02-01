@@ -71,6 +71,8 @@ class Whisper(BaseSTT):
         self.remove_tokens_with_space   = tf.cast([
             self.text_encoder[' '], self.eos_token_idx
         ] + t, tf.int32)
+        
+        self._logits_filter = get_filter(self)
 
     def _build_model(self, pretrained = None, ** kwargs):
         if pretrained is not None:
@@ -101,7 +103,7 @@ class Whisper(BaseSTT):
     
     @property
     def nospeech_token(self):
-        return '<|nospeech|>'
+        return '<|nospeech|>' if '<|nospeech|>' in self.text_encoder else '<|nocaptions|>'
     
     @property
     def timestamp_begin_idx(self):
@@ -161,7 +163,7 @@ class Whisper(BaseSTT):
     @property
     def special_tokens(self):
         return [
-            '<|startoftranscript|>', '<|startoflm|>', '<|startofprev|>', '<|nospeech|>',
+            '<|startoftranscript|>', '<|startoflm|>', '<|startofprev|>', self.nospeech_token,
             '<|notimestamps|>'
         ]
 
@@ -192,7 +194,7 @@ class Whisper(BaseSTT):
               ** kwargs
              ):
         kwargs.setdefault('max_length',     self.max_output_length)
-        kwargs.setdefault('logits_filter',  self.filter_logits)
+        kwargs.setdefault('logits_filter',  self._logits_filter)
         
         if len(tf.shape(inputs)) == 2: inputs = tf.expand_dims(inputs, axis = 0)
 
@@ -216,7 +218,7 @@ class Whisper(BaseSTT):
             ], axis = -1)
         
         output = self.stt_model.infer(inputs, tokens = tokens, training = training, ** kwargs)
-        
+
         return self.decode_output(output) if decode else output
 
     def get_start_tokens(self, lang = None, task = None):
@@ -232,88 +234,6 @@ class Whisper(BaseSTT):
             self.translate_token_idx if task == 'translate' else self.transcribe_token_idx
         ])
         return tokens
-    
-    @tf.function(input_signature = [
-        tf.TensorSpec(shape = (None, None), dtype = tf.float32),
-        tf.TensorSpec(shape = (None, None), dtype = tf.int32),
-        tf.TensorSpec(shape = (None, ),     dtype = tf.int32),
-        tf.TensorSpec(shape = (),           dtype = tf.int32),
-        tf.TensorSpec(shape = (),           dtype = tf.int32)
-    ])
-    def timestamp_filter(self, scores, tokens, to_remove, t = -1, max_initial_timestamp_index = 1):
-        if t == 0:
-            # suppress generating non-timestamp tokens at the beginning
-            to_remove = tf.concat([
-                to_remove, tf.range(self.timestamp_begin_idx)
-            ], axis = -1)
-
-            # apply the `max_initial_timestamp` option
-            if max_initial_timestamp_index > 0:
-                to_remove = tf.concat([
-                    to_remove, tf.range(self.timestamp_begin_idx + max_initial_timestamp_index, tf.shape(scores)[-1])
-                ], axis = -1)
-
-            scores = remove_batch_tokens(scores, to_remove)
-        else:
-            batch_size = tf.shape(scores)[0]
-
-            last_was_timestamp          = tokens[:, -1] >= self.timestamp_begin_idx
-            penultimate_was_timestamp   = t < 2 or tokens[:, -2] >= self.timestamp_begin_idx
-
-            to_remove = add_batch_index(to_remove, batch_size)
-
-            if tf.reduce_any(last_was_timestamp):
-                last_but_not_penultimate    = tf.logical_and(
-                    last_was_timestamp, tf.logical_not(penultimate_was_timestamp)
-                )
-                last_and_penultimate    = tf.logical_and(
-                    last_was_timestamp, penultimate_was_timestamp
-                )
-                if tf.reduce_any(last_but_not_penultimate):
-                    to_remove = tf.concat([
-                        to_remove,
-                        add_batch_index(tf.range(self.eos_token_idx), batch_size, last_but_not_penultimate)
-                    ], axis = 0)
-
-                if tf.reduce_any(last_and_penultimate):
-                    to_remove = tf.concat([
-                        to_remove,
-                        add_batch_index(tf.range(self.timestamp_begin_idx, tf.shape(scores)[-1]), batch_size, last_and_penultimate)
-                    ], axis = 0)
-
-            scores = remove_tokens(scores, to_remove)
-
-            # if sum of probability over timestamps is above any other token, sample timestamp
-            logits  = log_softmax(scores)
-
-            timestamp_logits = tf.math.reduce_logsumexp(logits[:, self.timestamp_begin_idx :], axis = -1)
-            max_text_logits  = tf.reduce_max(logits[:, : self.timestamp_begin_idx], axis = -1)
-
-            timestamp_over_text = timestamp_logits > max_text_logits
-            if tf.reduce_any(timestamp_over_text):
-                scores = remove_tokens(
-                    scores, add_batch_index(tf.range(self.timestamp_begin_idx), batch_size, timestamp_over_text)
-                )
-
-        return scores
-
-    @tf.function(input_signature = [
-        tf.TensorSpec(shape = (None, None), dtype = tf.float32),
-        tf.TensorSpec(shape = (None, None), dtype = tf.int32),
-        tf.TensorSpec(shape = (),           dtype = tf.int32)
-    ])
-    def filter_logits(self, scores, tokens, t = -1):
-        to_remove   = tf.cond(
-            t == 0,
-            lambda: self.remove_tokens_with_space,
-            lambda: self.remove_tokens
-        )
-        if isinstance(tokens, tf.TensorArray):
-            tokens = tf.transpose(tokens.stack()[:t], [1, 0])
-        filtered = self.timestamp_filter(scores, tokens, to_remove, t = t)
-        filtered.set_shape(scores.shape)
-
-        return filtered
     
     @timer
     def detect_language(self, audio):
@@ -419,3 +339,71 @@ class Whisper(BaseSTT):
                     prev_seek = seek
                     
         return all_segments
+
+def timestamp_filter(self, scores, tokens, to_remove, state, max_initial_timestamp = 1, ** _):
+    if state.state is None:
+        # suppress generating non-timestamp tokens at the beginning
+        to_remove = tf.concat([
+            to_remove, tf.range(self.timestamp_begin_idx)
+        ], axis = -1)
+
+        # apply the `max_initial_timestamp` option
+        if max_initial_timestamp > 0:
+            to_remove = tf.concat([
+                to_remove, tf.range(self.timestamp_begin_idx + max_initial_timestamp, tf.shape(scores)[-1])
+            ], axis = -1)
+
+        scores = remove_batch_tokens(scores, to_remove)
+    else:
+        batch_size = tf.shape(scores)[0]
+
+        last_was_timestamp          = tokens[:, -1] >= self.timestamp_begin_idx
+        penultimate_was_timestamp   = tf.cond(
+            state.step < 2,
+            lambda: tf.ones((tf.shape(tokens)[0], ), dtype = tf.bool),
+            lambda: tokens[:, -2] >= self.timestamp_begin_idx
+        )
+
+        to_remove_batch = add_batch_index(to_remove, batch_size)
+
+        if tf.reduce_any(last_was_timestamp):
+            last_but_not_penultimate    = tf.logical_and(
+                last_was_timestamp, tf.logical_not(penultimate_was_timestamp)
+            )
+            last_and_penultimate    = tf.logical_and(
+                last_was_timestamp, penultimate_was_timestamp
+            )
+            if tf.reduce_any(last_but_not_penultimate):
+                to_remove_batch = tf.concat([
+                    to_remove_batch,
+                    add_batch_index(tf.range(self.eos_token_idx), batch_size, last_but_not_penultimate)
+                ], axis = 0)
+
+            if tf.reduce_any(last_and_penultimate):
+                to_remove_batch = tf.concat([
+                    to_remove_batch,
+                    add_batch_index(tf.range(self.timestamp_begin_idx, tf.shape(scores)[-1]), batch_size, last_and_penultimate)
+                ], axis = 0)
+
+        scores = remove_tokens(scores, to_remove_batch)
+
+        # if sum of probability over timestamps is above any other token, sample timestamp
+        logits  = log_softmax(scores)
+
+        timestamp_logits = tf.math.reduce_logsumexp(logits[:, self.timestamp_begin_idx :], axis = -1)
+        max_text_logits  = tf.reduce_max(logits[:, : self.timestamp_begin_idx], axis = -1)
+
+        timestamp_over_text = timestamp_logits > max_text_logits
+        if tf.reduce_any(timestamp_over_text):
+            scores = remove_tokens(
+                scores, add_batch_index(tf.range(self.timestamp_begin_idx), batch_size, timestamp_over_text)
+            )
+
+    return scores
+
+def filter_logits(self, scores, tokens, state, ** _):
+    to_remove = self.remove_tokens_with_space if state.state is None else self.remove_tokens
+    return timestamp_filter(self, scores, tokens[:, :state.t], to_remove, state)
+
+def get_filter(self):
+    return lambda * args, ** kwargs: filter_logits(self, * args, ** kwargs)

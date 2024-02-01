@@ -70,6 +70,8 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         self.max_output_length  = max_output_length
         
         super().__init__(** kwargs)
+        
+        if hasattr(self.stt_model, 'set_tokens'): self.stt_model.set_tokens(** self.model_tokens)
     
     def _init_folders(self):
         super()._init_folders()
