@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -21,8 +20,8 @@ from models.stt.base_stt import BaseSTT, _deep_speech_en_symbols
 class Jasper(BaseSTT):
     def __init__(self, * args, ** kwargs):
         kwargs.update({
-            'audio_format'      : 'mel',
-            'architecture_name' : 'jasper'
+            'audio_format'  : 'mel',
+            'architecture'  : 'jasper'
         })
         super().__init__(* args, ** kwargs)
 

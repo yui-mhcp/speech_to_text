@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -11,38 +10,40 @@
 # limitations under the License.
 
 import os
-import tensorflow as tf
+import keras
 
-from custom_architectures.current_blocks import _get_var, Conv1DBN, MaskedConv1DBN
+from keras import layers
+
+from .current_blocks import _get_var, Conv1DBN, MaskedConv1DBN
 from custom_layers import get_activation, LogSoftmax, MaskedConv1D
 
 _pretrained_weights_file = os.path.join(
     'pretrained_models', 'pretrained_weights', 'pretrained_jasper.h5'
 )
 
-def JasperBlock(inputs,
-                filters,
-                use_mask,
-                repeat      = 3,
-                kernel_size     = 11,
-                strides     = 1,
-                use_bias    = False,
-                dilation    = 1,
-                padding     = 'same',
-                
-                drop_rate   = 0.2,
+def jasper_block(inputs,
+                 filters,
+                 use_mask,
+                 repeat      = 3,
+                 kernel_size     = 11,
+                 strides     = 1,
+                 use_bias    = False,
+                 dilation    = 1,
+                 padding     = 'same',
+                    
+                 drop_rate   = 0.2,
 
-                activation  = None,
+                 activation  = None,
                 
-                residual    = True,
-                residual_inputs = [],
+                 residual    = True,
+                 residual_inputs = [],
 
-                pretrained  = False,
-                name        = None
-               ):
+                 pretrained  = False,
+                 name        = None
+                ):
     conv_fn = Conv1DBN if not use_mask else MaskedConv1DBN
     
-    if activation is None: activation = tf.keras.layers.ThresholdedReLU(theta = 20.)
+    if activation is None: activation = layers.ThresholdedReLU(theta = 20.)
     name = '' if name is None else name + '_'
 
     x = inputs
@@ -75,7 +76,7 @@ def JasperBlock(inputs,
         for i, res_input in enumerate(residual_inputs):
             if pretrained:
                 residual_outputs.append(conv_fn(
-                    tf.keras.Sequential(name = '{}_model_residual_{}'.format(name, i+1)),
+                    keras.Sequential(name = '{}_model_residual_{}'.format(name, i+1)),
                     filters         = filters,
                     kernel_size     = 1,
                     strides         = 1,
@@ -106,12 +107,12 @@ def JasperBlock(inputs,
                     name            = '{}residual_{}'.format(name, i+1)
                 ))
         
-        x = tf.keras.layers.Add()([x] + residual_outputs)
+        x = layers.Add()([x] + residual_outputs)
     
     if activation is not None:
         x = get_activation('relu')(x)
     
-    if drop_rate > 0.: x = tf.keras.layers.Dropout(drop_rate)(x)
+    if drop_rate > 0.: x = layers.Dropout(drop_rate)(x)
         
         
     return x
@@ -140,15 +141,13 @@ def Jasper(input_shape,
            ** kwargs
           ):
     use_mask    = pad_value is not None
-    last_conv_fn    = MaskedConv1D if use_mask else tf.keras.layers.Conv1D
+    last_conv_fn    = MaskedConv1D if use_mask else layers.Conv1D
     if use_mixed_precision:
-        from tensorflow.keras.mixed_precision import experimental as mixed_precision
-        policy = mixed_precision.Policy('mixed_float16')
-        mixed_precision.set_policy(policy)
+        policy = keras.mixed_precision.set_global_policy('mixed_float16')
     
-    inputs = tf.keras.layers.Input(shape = input_shape, name = 'mel_input')
+    inputs = layers.Input(shape = input_shape, name = 'mel_input')
     
-    x = inputs if not use_mask else tf.keras.layers.Masking(mask_value = pad_value)(inputs)
+    x = inputs if not use_mask else keras.layers.Masking(mask_value = pad_value)(inputs)
     res = []
     for i in range(n_block):
         if _get_var(residual_dense, i): res.append(x)
@@ -173,17 +172,8 @@ def Jasper(input_shape,
     )(x)
     out = get_activation(last_activation)(out)
     
-    model = tf.keras.Model(inputs, out, name = name)
+    model = keras.Model(inputs, out, name = name)
     
     if pretrained: model.load_weights(pretrained_file)
     
     return model
-
-custom_functions    = {
-    'Jasper'    : Jasper
-}
-
-custom_objects  = {
-    "log_softmax"   : LogSoftmax,
-    "LogSoftmax"    : LogSoftmax
-}

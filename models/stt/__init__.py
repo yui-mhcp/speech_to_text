@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -12,14 +11,13 @@
 
 import os
 
-from models.model_utils import get_model_config
+from models.saving import get_model_config
 
-from models.stt.base_stt import BaseSTT
-from models.stt.jasper import Jasper
-from models.stt.deep_speech import DeepSpeech
-from models.stt.transformer_stt import TransformerSTT
-from models.stt.conformer_transducer import ConformerTransducer
-from models.stt.whisper import Whisper
+from .base_stt import BaseSTT
+from .jasper import Jasper
+from .deep_speech import DeepSpeech
+from .transformer_stt import TransformerSTT
+from .whisper import Whisper
 
 def get_model_lang(model):
     return get_model_config(model).get('lang', None)
@@ -42,23 +40,14 @@ def get_model(lang = None, model = None, ** kwargs):
 
 def search(keyword, audios, lang = None, model = None, ** kwargs):
     model = get_model(lang = lang, model = model)
-    return model.search(keyword, audios, ** kwargs)
+    return model.search(keyword, audios, lang = lang, ** kwargs)
 
 def predict(audios, lang = None, model = None, ** kwargs):
     model = get_model(lang = lang, model = model)
-    return model.predict(audios, ** kwargs)
+    return model.predict(audios, lang = lang, ** kwargs)
 
 
 _pretrained = {
-    'en'    : 'whisper',
-    'fr'    : 'whisper'
+    'en'    : 'pretrained_jasper'
 }
 
-_models = {
-    'BaseSTT'   : BaseSTT,
-    'Jasper'    : Jasper,
-    'Whisper'   : Whisper,
-    'DeepSpeech'    : DeepSpeech,
-    'TransformerSTT'    : TransformerSTT,
-    'ConformerTransducer'   : ConformerTransducer
-}

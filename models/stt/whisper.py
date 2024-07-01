@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -12,14 +12,14 @@
 import os
 import logging
 import numpy as np
-import tensorflow as tf
+import keras.ops as K
 
 from tqdm import tqdm
 from functools import cached_property
 
 from utils import load_json, dump_json
 from loggers import timer, time_logger
-from custom_layers import log_softmax
+from utils.keras_utils import TensorSpec, ops
 from models.stt.base_stt import BaseSTT
 from utils.text.text_encoder import WHISPER_LANGUAGES
 from custom_architectures.transformers_arch import whisper_arch
@@ -27,13 +27,15 @@ from utils.text import remove_tokens, remove_batch_tokens, remove_slice_tokens
 
 def add_batch_index(indices, batch_size, mask = None):
     if mask is None:
-        batch_indexes = tf.range(batch_size)
+        batch_indexes = ops.range(batch_size)
     else:
-        batch_indexes = tf.cast(tf.where(mask)[:, 0], tf.int32)
+        indexes = ops.where(mask)
+        indexes = indexes[0] if isinstance(indexes, list) else indexes[:, 0]
+        batch_indexes = ops.cast(indexes, 'int32')
     
-    return tf.stack([
-        tf.repeat(batch_indexes, tf.shape(indices)[0]),
-        tf.tile(indices, [tf.shape(batch_indexes)[0]])
+    return ops.stack([
+        ops.repeat(batch_indexes, ops.shape(indices)[0]),
+        ops.tile(indices, [ops.shape(batch_indexes)[0]])
     ], axis = 1)
 
 class Whisper(BaseSTT):
@@ -52,8 +54,8 @@ class Whisper(BaseSTT):
             kwargs.setdefault('pretrained_name',        pretrained)
         
         kwargs.update({
-            'audio_format'      : 'mel',
-            'architecture_name' : 'Whisper'
+            'audio_format'  : 'mel',
+            'architecture'  : 'Whisper'
         })
         super().__init__(lang = lang, pretrained = pretrained, ** kwargs)
         
@@ -67,23 +69,23 @@ class Whisper(BaseSTT):
         
         t = list(self.non_speech_token_indexes) + list(self.special_token_indexes)
 
-        self.remove_tokens              = tf.cast(t, tf.int32)
-        self.remove_tokens_with_space   = tf.cast([
+        self.remove_tokens              = ops.cast(t, 'int32')
+        self.remove_tokens_with_space   = ops.cast([
             self.text_encoder[' '], self.eos_token_idx
-        ] + t, tf.int32)
+        ] + t, 'int32')
         
         self._logits_filter = get_filter(self)
+        self._logits_filter = None
 
-    def _build_model(self, pretrained = None, ** kwargs):
-        if pretrained is not None:
-            super(BaseSTT, self)._build_model(
+    def build(self, pretrained = None, ** kwargs):
+        if pretrained is not None and 'stt_model' not in kwargs:
+            super(BaseSTT, self).build(
                 stt_model = whisper_arch.Whisper.from_pretrained(
                     pretrained = pretrained, decoder_eos_token = self.eos_token_idx, ** kwargs
                 )
             )
         else:
-            kwargs['architecture_name'] = 'Whisper'
-            super()._build_model(** kwargs)
+            super().build(** kwargs)
 
     @property
     def sos_token(self):
@@ -172,14 +174,13 @@ class Whisper(BaseSTT):
         return [self.text_encoder[token] for token in self.special_tokens]
 
     @timer(name = 'language detection')
-    @tf.function(reduce_retracing = True)
     def _detect_language(self, mel = None, encoder_output = None, tokens = None, training = False):
         if encoder_output is None: encoder_output = self.stt_model.encoder(mel, training = training)
         pred    = self.stt_model.decoder(
             tokens, encoder_output = encoder_output, training = training
         )
-        return tf.nn.softmax(tf.gather(
-            pred, tf.cast(self.language_indexes, tf.int32), axis = -1
+        return K.softmax(ops.take_along_axis(
+            pred[:, -1, :], ops.cast(self.language_indexes, 'int32')[:, None], axis = -1
         ), axis = -1)
     
     @timer(name = 'inference', log_if_root = False)
@@ -196,23 +197,23 @@ class Whisper(BaseSTT):
         kwargs.setdefault('max_length',     self.max_output_length)
         kwargs.setdefault('logits_filter',  self._logits_filter)
         
-        if len(tf.shape(inputs)) == 2: inputs = tf.expand_dims(inputs, axis = 0)
+        if len(ops.shape(inputs)) == 2: inputs = ops.expand_dims(inputs, axis = 0)
 
         if tokens is None:
             if lang is None: lang = [out[0] for out in self.detect_language(inputs)]
-            tokens = tf.cast(self.get_start_tokens(lang = lang, task = task), tf.int32)
+            tokens = ops.cast(self.get_start_tokens(lang = lang, task = task), 'int32')
         
-        if len(tf.shape(tokens)) == 1: tokens = tf.expand_dims(tokens, axis = 0)
+        if len(ops.shape(tokens)) == 1: tokens = ops.expand_dims(tokens, axis = 0)
         
         if len(tokens) == 1 and len(inputs) > 1:
-            tokens = tf.tile(tokens, [len(inputs), 1])
+            tokens = ops.tile(tokens, [len(inputs), 1])
         
         if prev_tokens is not None and len(prev_tokens) > 0 and self.start_of_prev_token_idx != -1:
-            prev_tokens = tf.cast(prev_tokens, tf.int32)
-            if len(tf.shape(prev_tokens)) == 1: prev_tokens = tf.expand_dims(prev_tokens, axis = 0)
-            if len(tf.shape(prev_tokens)) == 3: prev_tokens = prev_tokens[:, 0]
-            tokens = tf.concat([
-                tf.fill((len(tokens), 1), self.start_of_prev_token_idx),
+            prev_tokens = ops.cast(prev_tokens, 'int32')
+            if len(ops.shape(prev_tokens)) == 1: prev_tokens = ops.expand_dims(prev_tokens, axis = 0)
+            if len(ops.shape(prev_tokens)) == 3: prev_tokens = prev_tokens[:, 0]
+            tokens = ops.concat([
+                ops.fill((len(tokens), 1), self.start_of_prev_token_idx),
                 prev_tokens[:, - (kwargs['max_length'] // 2 - 1) :],
                 tokens
             ], axis = -1)
@@ -239,9 +240,9 @@ class Whisper(BaseSTT):
     def detect_language(self, audio):
         with time_logger.timer('pre_processing'):
             mel     = self.get_input(audio, pad_or_trim = True)
-            if len(mel.shape) == 2: mel = tf.expand_dims(mel, axis = 0)
+            if len(mel.shape) == 2: mel = ops.expand_dims(mel, axis = 0)
 
-            tokens  = tf.fill((mel.shape[0], 1), self.sos_token_idx)
+            tokens  = ops.fill((mel.shape[0], 1), self.sos_token_idx)
 
         probs   = self._detect_language(mel = mel, tokens = tokens)
         
@@ -343,60 +344,60 @@ class Whisper(BaseSTT):
 def timestamp_filter(self, scores, tokens, to_remove, state, max_initial_timestamp = 1, ** _):
     if state.state is None:
         # suppress generating non-timestamp tokens at the beginning
-        to_remove = tf.concat([
-            to_remove, tf.range(self.timestamp_begin_idx)
+        to_remove = ops.concat([
+            to_remove, ops.range(self.timestamp_begin_idx)
         ], axis = -1)
 
         # apply the `max_initial_timestamp` option
         if max_initial_timestamp > 0:
-            to_remove = tf.concat([
-                to_remove, tf.range(self.timestamp_begin_idx + max_initial_timestamp, tf.shape(scores)[-1])
+            to_remove = ops.concat([
+                to_remove, ops.range(self.timestamp_begin_idx + max_initial_timestamp, ops.shape(scores)[-1])
             ], axis = -1)
 
         scores = remove_batch_tokens(scores, to_remove)
     else:
-        batch_size = tf.shape(scores)[0]
+        batch_size = ops.shape(scores)[0]
 
         last_was_timestamp          = tokens[:, -1] >= self.timestamp_begin_idx
-        penultimate_was_timestamp   = tf.cond(
-            state.step < 2,
-            lambda: tf.ones((tf.shape(tokens)[0], ), dtype = tf.bool),
+        penultimate_was_timestamp   = ops.cond(
+            state.t < 2,
+            lambda: ops.ones((ops.shape(tokens)[0], ), dtype = 'bool'),
             lambda: tokens[:, -2] >= self.timestamp_begin_idx
         )
 
         to_remove_batch = add_batch_index(to_remove, batch_size)
 
-        if tf.reduce_any(last_was_timestamp):
-            last_but_not_penultimate    = tf.logical_and(
-                last_was_timestamp, tf.logical_not(penultimate_was_timestamp)
+        if ops.reduce_any(last_was_timestamp):
+            last_but_not_penultimate    = ops.logical_and(
+                last_was_timestamp, ops.logical_not(penultimate_was_timestamp)
             )
-            last_and_penultimate    = tf.logical_and(
+            last_and_penultimate    = ops.logical_and(
                 last_was_timestamp, penultimate_was_timestamp
             )
-            if tf.reduce_any(last_but_not_penultimate):
-                to_remove_batch = tf.concat([
+            if ops.reduce_any(last_but_not_penultimate):
+                to_remove_batch = ops.concat([
                     to_remove_batch,
-                    add_batch_index(tf.range(self.eos_token_idx), batch_size, last_but_not_penultimate)
+                    add_batch_index(ops.range(self.eos_token_idx), batch_size, last_but_not_penultimate)
                 ], axis = 0)
 
-            if tf.reduce_any(last_and_penultimate):
-                to_remove_batch = tf.concat([
+            if ops.reduce_any(last_and_penultimate):
+                to_remove_batch = ops.concat([
                     to_remove_batch,
-                    add_batch_index(tf.range(self.timestamp_begin_idx, tf.shape(scores)[-1]), batch_size, last_and_penultimate)
+                    add_batch_index(ops.range(self.timestamp_begin_idx, ops.shape(scores)[-1]), batch_size, last_and_penultimate)
                 ], axis = 0)
 
         scores = remove_tokens(scores, to_remove_batch)
 
         # if sum of probability over timestamps is above any other token, sample timestamp
-        logits  = log_softmax(scores)
+        logits  = K.log_softmax(scores)
 
-        timestamp_logits = tf.math.reduce_logsumexp(logits[:, self.timestamp_begin_idx :], axis = -1)
-        max_text_logits  = tf.reduce_max(logits[:, : self.timestamp_begin_idx], axis = -1)
+        timestamp_logits = K.logsumexp(logits[:, self.timestamp_begin_idx :], axis = -1)
+        max_text_logits  = ops.reduce_max(logits[:, : self.timestamp_begin_idx], axis = -1)
 
         timestamp_over_text = timestamp_logits > max_text_logits
-        if tf.reduce_any(timestamp_over_text):
+        if ops.reduce_any(timestamp_over_text):
             scores = remove_tokens(
-                scores, add_batch_index(tf.range(self.timestamp_begin_idx), batch_size, timestamp_over_text)
+                scores, add_batch_index(ops.range(self.timestamp_begin_idx), batch_size, timestamp_over_text)
             )
 
     return scores

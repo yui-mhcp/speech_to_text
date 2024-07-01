@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -15,11 +14,11 @@ import time
 import logging
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
 from tqdm import tqdm
 
 from loggers import timer, time_logger
+from utils.keras_utils import TensorSpec, ops
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_audio_model import BaseAudioModel
 from utils import dump_json, load_json, normalize_filename, pad_batch, get_filename, should_predict
@@ -37,8 +36,12 @@ DEFAULT_MAX_MEL_LENGTH  = 1024
 DEFAULT_MAX_TEXT_LENGTH = min(256, DEFAULT_MAX_MEL_LENGTH // 2)
         
 class BaseSTT(BaseTextModel, BaseAudioModel):
+    _directories    = {
+        ** BaseTextModel._directories, 'search_dir' : '{root}/{self.name}/search'
+    }
+    
     output_signature    = BaseTextModel.text_signature
-    get_output  = BaseTextModel.tf_encode_text
+    prepare_output  = BaseTextModel.encode_text
     
     def __init__(self,
                  lang,
@@ -72,15 +75,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         super().__init__(** kwargs)
         
         if hasattr(self.stt_model, 'set_tokens'): self.stt_model.set_tokens(** self.model_tokens)
-    
-    def _init_folders(self):
-        super()._init_folders()
-        os.makedirs(self.search_dir, exist_ok = True)
 
-    def _build_model(self, architecture_name, ** kwargs):
-        super(BaseSTT, self)._build_model(
+    def build(self, architecture, stt_model = None, ** kwargs):
+        if stt_model is None:
             stt_model = {
-                'architecture_name' : architecture_name,
+                'architecture'  : architecture,
                 'input_shape'   : self.mel_input_shape,
                 'vocab_size'    : self.vocab_size,
                 'pad_value'     : self.pad_mel_value,
@@ -89,7 +88,8 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 'pad_token'     : self.blank_token_idx,
                 ** kwargs
             }
-        )
+
+        super(BaseSTT, self).build(stt_model = stt_model)
             
     @property
     def is_encoder_decoder(self):
@@ -104,10 +104,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         return not self.is_encoder_decoder
     
     @property
-    def search_dir(self):
-        return os.path.join(self.folder, 'search')
-    
-    @property
     def mel_input_shape(self):
         mel_length = self.max_input_length if self.use_fixed_length_input else None
         return (mel_length, ) + self.audio_signature.shape[2:]
@@ -118,7 +114,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     
     @property
     def input_signature(self):
-        inp_sign = tf.TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = tf.float32)
+        inp_sign = TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = 'float32')
         
         return inp_sign if not self.is_encoder_decoder else (inp_sign, self.text_signature)
         
@@ -173,8 +169,8 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         return self(inputs, training = training, ** kwargs)
     
     def decode_audio(self, encoder_output, training = False, return_state = False, ** kwargs):
-        if len(tf.shape(encoder_output)) == 2:
-            encoder_output = tf.expand_dims(encoder_output, axis = 0)
+        if len(ops.shape(encoder_output)) == 2:
+            encoder_output = ops.expand_dims(encoder_output, axis = 0)
         
         if self.use_ctc_decoder:
             return encoder_output if not return_state else (encoder_output, None)
@@ -217,7 +213,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return self.text_encoder.distance(hypothesis, truth, ** kwargs)
     
-    def get_input(self, data, pad_or_trim = True):
+    def prepare_input(self, data, pad_or_trim = True):
         audio = self.get_audio(data)
         
         if pad_or_trim:
@@ -226,19 +222,19 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         return audio
     
     def pad_or_trim(self, audio):
-        if tf.shape(audio)[0] > self.max_input_length:
+        if ops.shape(audio)[0] > self.max_input_length:
             audio = audio[: self.max_input_length]
-        elif self.use_fixed_length_input and tf.shape(audio)[0] != self.max_input_length:
-            audio = tf.pad(
-                audio, [(0, self.max_input_length - tf.shape(audio)[0]), (0, 0)],
+        elif self.use_fixed_length_input and ops.shape(audio)[0] != self.max_input_length:
+            audio = ops.pad(
+                audio, [(0, self.max_input_length - ops.shape(audio)[0]), (0, 0)],
                 constant_values = self.pad_mel_value
             )
         
         return audio
     
-    def encode_data(self, data):
-        mel  = self.get_input(data)
-        text = self.get_output(data)
+    def prepare_data(self, data):
+        mel  = self.prepare_input(data)
+        text = self.prepare_output(data)
         
         if not self.is_encoder_decoder: return mel, text
         
@@ -248,9 +244,9 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     
     def filter_data(self, inputs, output):
         mel = inputs[0] if isinstance(inputs, tuple) else inputs
-        return tf.logical_and(
-            tf.shape(mel)[0] <= self.max_input_length,
-            tf.shape(output)[0] <= self.max_output_length
+        return ops.logical_and(
+            ops.shape(mel)[0] <= self.max_input_length,
+            ops.shape(output)[0] <= self.max_output_length
         )
         
     def augment_data(self, inputs, output):
@@ -266,8 +262,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             pad_values = (pad_values, self.blank_token_idx)
         
         kwargs.update({
-            'batch_before_map'  : True,
-            'padded_batch'  : True,
             'pad_kwargs'    : {'padding_values' : pad_values}
         })
         if self.use_fixed_length_input:
@@ -288,7 +282,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         pred    = self.decode_output(self(inputs, training = False))
         if self.is_encoder_decoder:
             infer = self.infer(
-                inputs[:-1], early_stopping = False, max_length = tf.shape(output)[1], decode = True
+                inputs[:-1], early_stopping = False, max_length = ops.shape(output)[1], decode = True
             )
         
         target = self.decode_output(output)
@@ -325,7 +319,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         segments = []
         for i, start in enumerate(range(0, len(mel), window)):
             pred = self.infer(
-                tf.expand_dims(mel[start : start + window], axis = 0), decode = False, ** kwargs
+                ops.expand_dims(mel[start : start + window], axis = 0), decode = False, ** kwargs
             )
 
             self._add_segment(
@@ -500,7 +494,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             keyword = keyword, distance_fn = self.distance, rate = self.audio_rate,
             directory = self.search_dir, filename = infos['filename'],
             infos = infos['alignment'], threshold = threshold
-        ) for infos in pred])
+        ) for _, infos in pred])
     
     def get_config(self, * args, ** kwargs):
         config = super().get_config(* args, ** kwargs)    
@@ -514,6 +508,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         })
         
         return config
+
 def post_process(segment, infos, post_processing = None, verbose = True, ** kwargs):
     if verbose == 2:
         logger.info('Add segment from {} to {} with text {}'.format(

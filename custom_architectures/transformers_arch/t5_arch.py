@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,16 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" TF 2.0 T5 (and Flan-T5) model, compatible with the `transformers`' model. """
-
-import tensorflow as tf
+import keras
+import keras.ops as K
 
 from tqdm import tqdm
 
-from custom_layers import FasterEmbedding, MultiHeadAttention, HParamsMHA, get_activation
-from custom_architectures.transformers_arch.transformer_arch import _get_state_length, _get_state_step
-from custom_architectures.transformers_arch.embedding_head import EmbeddingHead, HParamsEmbeddingHead
-from custom_architectures.transformers_arch.text_transformer_arch import *
+from custom_layers import CustomEmbedding, RMSLayerNormalization, ResidualMultiHeadAttention, HParamsMHA, get_activation
+from .transformer_arch import _get_state_length, _get_state_step
+from .text_transformer_arch import *
 
 _default_t5_mha_config  = {
     'scale' : False,
@@ -47,7 +44,7 @@ HParamsT5Block  = HParamsTextTransformerBlock(
 )
 
 HParamsT5Encoder    = HParamsT5Block
-HParamsT5Embedding  = HParamsT5Encoder(** HParamsEmbeddingHead)
+#HParamsT5Embedding  = HParamsT5Encoder(** HParamsEmbeddingHead)
 
 HParamsT5Decoder  = HParamsT5Block(
     use_encoder_attention   = True,
@@ -56,32 +53,15 @@ HParamsT5Decoder  = HParamsT5Block(
     final_bias  = False
 )
 
-class T5LayerNormalization(tf.keras.layers.Layer):
-    def __init__(self, epsilon = 1e-6, ** kwargs):
-        super().__init__(** kwargs)
-        self.epsilon    = epsilon
-    
-    def build(self, input_shape):
-        self.weight = self.add_weight('weight', shape = (input_shape[-1], ), initializer = 'ones')
-        super().build(input_shape)
-    
-    def call(self, inputs):
-        variances   = tf.math.reduce_mean(tf.math.square(inputs), axis = -1, keepdims = True)
-        return inputs * tf.math.rsqrt(variances + self.epsilon) * self.weight 
-    
-    def get_config(self):
-        return {
-            ** super().get_config(),
-            'epsilon'   : self.epsilon
-        }
-
-class T5MultiHeadAttention(MultiHeadAttention):
+@keras.saving.register_keras_serializable('transformers')
+class T5MultiHeadAttention(ResidualMultiHeadAttention):
     def compute_attention(self, attn_logits, v, * args, positional_bias = None, ** kwargs):
         if positional_bias is not None:
             attn_logits = attn_logits + positional_bias
         
         return super().compute_attention(attn_logits, v, * args, ** kwargs)
-        
+
+@keras.saving.register_keras_serializable('transformers')
 class T5Block(TextTransformerBlock):
     default_params  = HParamsT5Block
     _attr_to_set    = TextTransformerBlock._attr_to_set + [
@@ -93,7 +73,7 @@ class T5Block(TextTransformerBlock):
             vocab_size,
             embedding_dim,
             max_input_length    = max_input_length,
-            norm_class  = T5LayerNormalization,
+            norm_class  = RMSLayerNormalization,
             mha_class   = T5MultiHeadAttention,
             ** kwargs
         )
@@ -101,15 +81,15 @@ class T5Block(TextTransformerBlock):
     def _init_input_layers(self, ** kwargs):
         super()._init_input_layers(** kwargs)
         if self.use_relative_positional_bias:
-            with tf.name_scope('relative_pos_bias'):
+            with keras.scope('relative_pos_bias'):
                 self.relative_attention_bias = self.add_weight(
                     shape   = (self.hparams.num_buckets, self.hparams.mha_num_heads),
                     name    = 'embeddings'
                 )
     
     def compute_bias(self, q_len, k_len, q_offset = 0):
-        q_pos   = tf.range(q_len)[:, tf.newaxis] + q_offset
-        k_pos   = tf.range(k_len)[tf.newaxis, :]
+        q_pos   = K.arange(q_len)[:, None] + q_offset
+        k_pos   = K.arange(k_len)[None, :]
         rel_pos = k_pos - q_pos
         
         rel_pos_bucket  = self._relative_position_bucket(
@@ -119,38 +99,38 @@ class T5Block(TextTransformerBlock):
             max_distance    = self.max_distance
         )
         
-        values  = tf.gather(
-            self.relative_attention_bias, rel_pos_bucket
+        values  = K.take(
+            self.relative_attention_bias, rel_pos_bucket, axis = 0
         )
-        values  = tf.expand_dims(
-            tf.transpose(values, [2, 0, 1]), axis = 0
+        values  = K.expand_dims(
+            K.transpose(values, [2, 0, 1]), axis = 0
         )
         return values
     
     def call(self,
              inputs,
-             * args,
+             *,
              initial_state  = None,
-             first_layer_idx    = -1,
              positional_bias    = None,
              ** kwargs
             ):
         if self.use_relative_positional_bias and positional_bias is None and first_layer_idx == -1:
-            seq_len     = tf.shape(inputs)[1]
+            seq_len     = K.shape(inputs)[1]
             state_len   = _get_state_length(initial_state)
-            step        = _get_state_step(initial_state)
-            if kwargs.get('debug', False):
-                tf.print('seq :', seq_len, 'state len :', state_len, 'step :', step)
+            if initial_state:
+                offset = _get_state_step(initial_state)
+            else:
+                offset = 0
             
-            positional_bias = self.compute_bias(
-                seq_len, seq_len + state_len, step
-            )
+            if kwargs.get('debug', False) and keras.backend.backend() == 'tensorflow':
+                import tensorflow as tf
+                tf.print('seq :', seq_len, 'state len :', state_len, 'step :', offset)
+            
+            positional_bias = self.compute_bias(seq_len, seq_len + state_len, offset)
         
         return super().call(
             inputs,
-            * args,
             initial_state   = initial_state,
-            first_layer_idx     = first_layer_idx,
             attention_kwargs    = {'positional_bias' : positional_bias},
             ** kwargs
         )
@@ -210,6 +190,7 @@ class T5Block(TextTransformerBlock):
         return instance
 
 
+@keras.saving.register_keras_serializable('transformers')
 class T5Encoder(T5Block):
     default_params = HParamsT5Encoder
     
@@ -228,7 +209,7 @@ class T5Encoder(T5Block):
             {k : v for k, v in get_layers(pretrained).items() if 'decoder' not in k}, ** kwargs
         )
 
-class T5Embedding(T5Encoder):
+"""class T5Embedding(T5Encoder):
     default_params = HParamsT5Embedding
     
     def __init__(self, output_dim, vocab_size, embedding_dim, ** kwargs):
@@ -240,7 +221,9 @@ class T5Embedding(T5Encoder):
 
     def compute_output(self, output, training = False, mask = None, ** kwargs):
         return self.embedding_head(output, mask = mask, training = training)
+"""
 
+@keras.saving.register_keras_serializable('transformers')
 class T5Decoder(T5Block):
     default_params = HParamsT5Decoder
     
@@ -287,6 +270,7 @@ class T5Decoder(T5Block):
             {k : v for k, v in get_layers(pretrained).items() if 'encoder' not in k}, ** kwargs
         )
 
+@keras.saving.register_keras_serializable('transformers')
 class T5(TextTransformer):
     encoder_class   = T5Encoder
     decoder_class   = T5Decoder
@@ -314,7 +298,8 @@ class T5(TextTransformer):
                         ** kwargs
                        ):
         if pretrained is None:
-            pretrained = transformers_t5(pretrained_name, pretrained_task)
+            with tf.device('cpu'):
+                pretrained = transformers_t5(pretrained_name, pretrained_task)
 
         config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
@@ -343,29 +328,9 @@ class T5(TextTransformer):
 def transformers_t5(name = 'google/flan-t5-large', task = 'generation'):
     import transformers
     if task == 'generation':
-        return transformers.TFT5ForConditionalGeneration.from_pretrained(name)
+        return transformers.T5ForConditionalGeneration.from_pretrained(name)
     else:
         raise ValueError("Unknown task !\n  Accepted : {}\n  Got : {}".format(
             tuple(_transformers_pretrained_task.keys()), task
         ))
 
-_t5_classes   = {
-    'T5Encoder'   : T5Encoder,
-    'T5Embedding' : T5Embedding,
-    'T5Decoder'   : T5Decoder,
-    'T5'          : T5
-}
-        
-custom_functions    = {
-    ** _t5_classes,
-    'transformers_t5'   : transformers_t5
-}
-
-custom_objects  = {
-    ** _t5_classes,
-    'TransformerEncoder'    : TransformerEncoder
-}
-
-_encoders   = {'T5' : T5Embedding}
-_decoders   = {'T5' : T5Decoder}
-_transformers   = {'T5' : T5}

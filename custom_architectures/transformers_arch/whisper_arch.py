@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,16 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" TF 2.0 Whisper model, compatible with the official model (https://github.com/openai/whisper). """
-
 import os
+import keras
 import numpy as np
-import tensorflow as tf
+import keras.ops as K
 
 from custom_architectures.simple_models import HParamsConvBN, simple_cnn
-from custom_architectures.transformers_arch.transformer_arch import *
-from custom_architectures.transformers_arch.text_transformer_arch import TextTransformer
-from custom_architectures.transformers_arch.gpt2_arch import GPT2, HParamsBaseGPT2
+from .transformer_arch import *
+from .text_transformer_arch import TextTransformer
+from .gpt2_arch import GPT2, HParamsBaseGPT2
 
 WHISPER_MODELS = {
     "tiny.en": "https://openaipublic.azureedge.net/main/whisper/models/d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt",
@@ -92,17 +90,20 @@ HParamsWhisperDecoder   = HParamsBaseGPT2(
     ffn_activation  = 'gelu'
 )
 
-def get_pos_embedding(max_length, embedding_dim, max_timescale = 10000, dtype = tf.float32):
+def get_pos_embedding(max_length, embedding_dim, max_timescale = 10000, dtype = 'float32'):
     """ Returns sinusoids for positional embedding """
     assert embedding_dim % 2 == 0
     
-    log_timescale_increment = tf.cast(np.log(max_timescale) / (embedding_dim // 2 - 1), dtype)
+    log_timescale_increment = K.convert_to_tensor(
+        np.log(max_timescale) / (embedding_dim // 2 - 1), dtype
+    )
     
-    inv_timescales  = tf.exp(-log_timescale_increment * tf.range(embedding_dim // 2, dtype = dtype))
+    inv_timescales  = K.exp(-log_timescale_increment * K.arange(embedding_dim // 2, dtype = dtype))
 
-    scaled_time = tf.range(max_length, dtype = dtype)[:, tf.newaxis] * inv_timescales[tf.newaxis, :]
-    return tf.concat([tf.sin(scaled_time), tf.cos(scaled_time)], axis = 1)
+    scaled_time = K.arange(max_length, dtype = dtype)[:, None] * inv_timescales[None, :]
+    return K.concatenate([K.sin(scaled_time), K.cos(scaled_time)], axis = 1)
 
+@keras.saving.register_keras_serializable('whisper')
 class WhisperEncoder(TransformerBlock):
     default_params  = HParamsWhisperEncoder
     _attr_to_set    = TransformerBlock._attr_to_set + [
@@ -113,60 +114,57 @@ class WhisperEncoder(TransformerBlock):
         super().__init__(
             n_mel_channels = n_mel_channels, embedding_dim = embedding_dim, ** kwargs
         )
-    
-    def _init_input_layers(self, ** kwargs):
-        with tf.name_scope(self.name):
-            self.feature_extractor  = simple_cnn(** self.hparams(
-                use_sequential  = False,
-                input_shape     = (None, self.n_mel_channels),
-                output_shape    = self.embedding_dim,
-                conv_type   = 'conv1d',
-                use_mask    = self.hparams.use_mask,
-                filters     = self.embedding_dim,
-                strides     = [1, 2],
-                padding     = 'same',
-                final_activation    = self.hparams.activation,
-                flatten     = False,
-                dense_as_final  = False,
-                name    = 'feature_extractor'
-            ))
-        
-            self.pos_encoding   = tf.Variable(get_pos_embedding(
-                self.max_input_length, self.embedding_dim, dtype = tf.float32
-            ), dtype = tf.float32, trainable = False, name = 'pos_encoding')
+        self.pos_encoding   = K.convert_to_tensor(get_pos_embedding(
+            self.max_input_length, self.embedding_dim, dtype = 'float32'
+        ), dtype = 'float32')
 
-    @property
-    def input_signature(self):
-        return tf.TensorSpec(shape = (None, None, self.n_mel_channels), dtype = tf.float32)
-    
-    @property
-    def dummy_inputs(self):
-        return tf.random.normal((1, 128, self.n_mel_channels))
+    def build(self, input_shape):
+        self.feature_extractor  = simple_cnn(** self.hparams(
+            use_sequential  = False,
+            input_shape     = (None, self.n_mel_channels),
+            output_shape    = self.embedding_dim,
+            conv_type   = 'conv1d',
+            use_mask    = self.hparams.use_mask,
+            filters     = self.embedding_dim,
+            strides     = [1, 2],
+            padding     = 'same',
+            activation  = self.hparams.activation,
+            final_activation    = self.hparams.activation,
+            flatten     = False,
+            dense_as_final  = False,
+            name    = 'feature_extractor'
+        ))
+        super().build((None, None, self.embedding_dim))
+
 
     def prepare_input(self, inputs, training = False, mask = None, ** kwargs):
         embedded = self.feature_extractor(inputs, training = training, mask = mask)
-        mask_shape  = [tf.shape(embedded)[0], 1, 1, tf.shape(embedded)[1]]
-        mask     = tf.reshape(embedded._keras_mask, mask_shape) if self.use_mask else tf.ones(
-            mask_shape, dtype = tf.bool
-        )
+        if getattr(embedded, '_keras_mask', None) is not None:
+            mask = embedded._keras_mask[:, None, None, :]
+        else:
+            mask = K.ones((K.shape(embedded)[0], 1, 1, K.shape(embedded)[1]), dtype = 'bool')
 
-        embedded = embedded + tf.cast(
-            self.pos_encoding[tf.newaxis, :tf.shape(embedded)[1]], embedded.dtype
+        embedded = embedded + K.cast(
+            self.pos_encoding[None, :K.shape(embedded)[1]], embedded.dtype
         )
-        embedded._keras_mask = mask
+        try:
+            embedded._keras_mask = mask
+        except AttributeError:
+            pass
         
         return embedded
 
     def transfer_weights(self, pretrained, ** kwargs):
         from models.weights_converter import _transformer_patterns, name_based_partial_transfer_learning
 
-        if isinstance(pretrained, dict):
-            pretrained = {k : v for k, v in pretrained.items() if k.startswith('encoder')}
+        if isinstance(pretrained, dict) and any('encoder' in k for k in pretrained):
+            pretrained = {k : v for k, v in pretrained.items() if 'encoder' in k}
 
         return name_based_partial_transfer_learning(
             self, pretrained, skip_root = False, patterns = {
                 ** _transformer_patterns, 'blocks/' : 'layer_', '_ln' : '_norm',
-                'ffn/0' : 'ffn/dense_1', 'ffn/2' : 'ffn/dense_2', 'mha_norm' : 'mha/norm_input'
+                'ffn/0' : 'ffn/dense_1', 'ffn/2' : 'ffn/dense_2', 'mha_norm' : 'mha/norm_input',
+                'final_layer_norm' : 'norm', 'layers/' : 'layer_'
             }, ** kwargs
         )
         
@@ -191,7 +189,7 @@ class WhisperEncoder(TransformerBlock):
         )
 
         instance = cls(** config(** kwargs))
-        instance._build()
+        instance.build((None, None, config['n_mel_channels']))
 
         instance.transfer_weights(pretrained, tqdm = tqdm, ** kwargs)
 
@@ -204,13 +202,14 @@ class WhisperDecoder(GPT2):
         from models.weights_converter import _transformer_patterns, name_based_partial_transfer_learning
 
         if isinstance(pretrained, dict):
-            pretrained = {k : v for k, v in pretrained.items() if k.startswith('decoder')}
+            pretrained = {k : v for k, v in pretrained.items() if 'decoder' in k}
         
         return name_based_partial_transfer_learning(
             self, pretrained, skip_root = False, patterns = {
                 ** _transformer_patterns, 'blocks/' : 'layer_', '_ln' : '_norm',
                 'ffn/0' : 'ffn/dense_1', 'ffn/2' : 'ffn/dense_2',
-                '(attn|mha)_norm' : 'mha/norm_input', 'cross_' : 'enc_', 'enc_attn' : 'enc_mha'
+                '(attn|mha)_norm' : 'mha/norm_input', 'cross_' : 'enc_', 'enc_attn' : 'enc_mha',
+                'final_layer_norm' : 'norm', 'layers/' : 'layer_'
             }, ** kwargs
         )
         
@@ -247,8 +246,13 @@ class Whisper(TextTransformer):
     
     _shared_keys    = TextTransformer._shared_keys + ['n_mel_channels']
     
-    def __init__(self, * args, name = 'Whisper', ** kwargs):
-        super().__init__(* args, name = name, ** kwargs)
+    def __init__(self, * args, ** kwargs):
+        super().__init__(* args, ** kwargs)
+    
+    def prepare_for_xla(self, * args, ** kwargs):
+        if hasattr(self.decoder, 'prepare_for_xla'):
+            _, kwargs = self.decoder.prepare_for_xla(** kwargs)
+        return (self, ) + args, kwargs
     
     @classmethod
     def from_pretrained(cls,
@@ -278,7 +282,7 @@ class Whisper(TextTransformer):
         )
 
         instance = cls(** config(** kwargs))
-        instance._build()
+        instance.build([(None, None, config.n_mel_channels), (None, None)])
 
         instance.encoder.transfer_weights(pretrained, tqdm = tqdm, ** kwargs)
         instance.decoder.transfer_weights(pretrained, tqdm = tqdm, ** kwargs)
@@ -292,7 +296,7 @@ def load_whisper(pretrained_name = 'medium', pretrained = None, ** kwargs):
     
     if pretrained is None:
         from utils.file_utils import download_file
-        from models import _pretrained_models_folder
+        from models import get_pretrained_weights_dir
         
         if pretrained_name.startswith('whisper-'):
             pretrained_name = pretrained_name.replace('whisper-', '')
@@ -306,8 +310,7 @@ def load_whisper(pretrained_name = 'medium', pretrained = None, ** kwargs):
                 ))
 
             filename = download_file(
-                WHISPER_MODELS[pretrained_name],
-                directory = os.path.join(_pretrained_models_folder, 'pretrained_weights')
+                WHISPER_MODELS[pretrained_name], directory = get_pretrained_weights_dir()
             )
 
             if filename is None:
@@ -319,25 +322,31 @@ def load_whisper(pretrained_name = 'medium', pretrained = None, ** kwargs):
         
         pretrained = _whisper_loaded[pretrained_name]
     
-    state_dict = pretrained if isinstance(pretrained, dict) else {
-        'dims' : pretrained.dims.__dict__, 'model_state_dict' : pretrained.state_dict()
-    }
+    if isinstance(pretrained, dict):
+        state_dict = pretrained
+    elif hasattr(pretrained, 'dims'):
+        state_dict = {
+            'dims' : pretrained.dims.__dict__, 'model_state_dict' : pretrained.state_dict()
+        }
+    elif hasattr(pretrained, 'config'):
+        state_dict = {
+            'model_state_dict' : pretrained.state_dict(),
+            'dims'  : {
+                'n_mels'    : pretrained.config.num_mel_bins,
+                'n_vocab'   : pretrained.config.vocab_size,
+                
+                'n_audio_state' : pretrained.config.d_model,
+                'n_audio_ctx'   : pretrained.config.max_source_positions,
+                'n_audio_layer' : pretrained.config.encoder_layers,
+                'n_audio_head'  : pretrained.config.encoder_attention_heads,
+
+                'n_text_state' : pretrained.config.d_model,
+                'n_text_ctx'   : pretrained.config.max_target_positions,
+                'n_text_layer' : pretrained.config.decoder_layers,
+                'n_text_head'  : pretrained.config.decoder_attention_heads
+            }
+        }
+        print(state_dict['dims'])
     
     return state_dict
 
-_whisper_classes    = {
-    'WhisperEncoder'    : WhisperEncoder,
-    'WhisperDecoder'    : WhisperDecoder,
-    'Whisper'       : Whisper
-}
-
-custom_functions    = {
-    ** _whisper_classes
-}
-
-custom_objects  = {
-    ** _whisper_classes
-}
-_encoders   = {'Whisper' : WhisperEncoder}
-_decoders   = {'Whisper' : WhisperDecoder}
-_transformers   = {'Whisper'    : Whisper}
