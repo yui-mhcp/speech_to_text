@@ -15,7 +15,7 @@ import keras
 from keras import layers
 
 from .current_blocks import _get_var, Conv1DBN, MaskedConv1DBN
-from custom_layers import get_activation, LogSoftmax, MaskedConv1D
+from custom_layers import get_activation, MaskedConv1D
 
 _pretrained_weights_file = os.path.join(
     'pretrained_models', 'pretrained_weights', 'pretrained_jasper.h5'
