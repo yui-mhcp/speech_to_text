@@ -11,7 +11,7 @@
 
 import os
 
-from models.saving import get_model_config
+from models.utils import get_model_config
 
 from .base_stt import BaseSTT
 from .jasper import Jasper
