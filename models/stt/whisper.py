@@ -19,7 +19,7 @@ from functools import cached_property
 
 from utils import load_json, dump_json
 from loggers import timer, time_logger
-from utils.keras_utils import TensorSpec, ops
+from utils.keras_utils import TensorSpec, ops, graph_compile
 from models.stt.base_stt import BaseSTT
 from utils.text.text_encoder import WHISPER_LANGUAGES
 from custom_architectures.transformers_arch import whisper_arch
@@ -77,7 +77,9 @@ class Whisper(BaseSTT):
         self._logits_filter = get_filter(self)
         self._logits_filter = None
 
-    def build(self, pretrained = None, ** kwargs):
+    def build(self, pretrained = None, stt_model = None, ** kwargs):
+        if stt_model is not None: return super().build(stt_model = stt_model)
+    
         if pretrained is not None and 'stt_model' not in kwargs:
             super(BaseSTT, self).build(
                 stt_model = whisper_arch.Whisper.from_pretrained(
@@ -173,52 +175,77 @@ class Whisper(BaseSTT):
     def special_token_indexes(self):
         return [self.text_encoder[token] for token in self.special_tokens]
 
-    @timer(name = 'language detection')
+    @cached_property
+    def compiled_detect_language(self):
+        mel_signature = self.infer_signature
+        
+        return graph_compile(
+            self._detect_language,
+            prefer_xla  = True,
+            input_signature = [
+                mel_signature,
+                TensorSpec(
+                    shape = (None, mel_signature.shape[1], self.model.hparams.encoder_embedding_dim),
+                    dtype = 'float32'
+                ),
+                TensorSpec(shape = (None, None), dtype = 'int32')
+            ]
+        )
+    
     def _detect_language(self, mel = None, encoder_output = None, tokens = None, training = False):
-        if encoder_output is None: encoder_output = self.stt_model.encoder(mel, training = training)
-        pred    = self.stt_model.decoder(
+        if encoder_output is None:
+            encoder_output = self.model.encoder(mel, training = training)
+        
+        pred = self.model.decoder(
             tokens, encoder_output = encoder_output, training = training
         )
         return K.softmax(ops.take_along_axis(
-            pred[:, -1, :], ops.cast(self.language_indexes, 'int32')[:, None], axis = -1
+            pred[:, -1, :], ops.convert_to_tensor(self.language_indexes, 'int32')[:, None], 1
         ), axis = -1)
     
     @timer(name = 'inference', log_if_root = False)
     def infer(self,
               inputs,
-              tokens    = None,
               training  = False,
-              lang      = None,
-              task      = None,
-              decode    = False,
+              *,
+              
+              lang  = None,
+              task  = None,
+              tokens    = None,
               prev_tokens   = None,
+              
+              decode    = False,
+              
               ** kwargs
              ):
         kwargs.setdefault('max_length',     self.max_output_length)
         kwargs.setdefault('logits_filter',  self._logits_filter)
         
-        if len(ops.shape(inputs)) == 2: inputs = ops.expand_dims(inputs, axis = 0)
+        if ops.rank(inputs) == 2: inputs = ops.expand_dims(inputs, axis = 0)
 
         if tokens is None:
             if lang is None: lang = [out[0] for out in self.detect_language(inputs)]
-            tokens = ops.cast(self.get_start_tokens(lang = lang, task = task), 'int32')
+            tokens = ops.convert_to_tensor(
+                self.get_start_tokens(lang = lang, task = task), 'int32'
+            )
         
-        if len(ops.shape(tokens)) == 1: tokens = ops.expand_dims(tokens, axis = 0)
+        if ops.rank(tokens) == 1: tokens = ops.expand_dims(tokens, axis = 0)
         
         if len(tokens) == 1 and len(inputs) > 1:
             tokens = ops.tile(tokens, [len(inputs), 1])
         
         if prev_tokens is not None and len(prev_tokens) > 0 and self.start_of_prev_token_idx != -1:
-            prev_tokens = ops.cast(prev_tokens, 'int32')
-            if len(ops.shape(prev_tokens)) == 1: prev_tokens = ops.expand_dims(prev_tokens, axis = 0)
-            if len(ops.shape(prev_tokens)) == 3: prev_tokens = prev_tokens[:, 0]
+            prev_tokens = ops.convert_to_tensor(prev_tokens, 'int32')
+            if ops.rank(prev_tokens) == 1:   prev_tokens = ops.expand_dims(prev_tokens, axis = 0)
+            elif ops.rank(prev_tokens) == 3: prev_tokens = prev_tokens[:, 0, :]
+            
             tokens = ops.concat([
                 ops.fill((len(tokens), 1), self.start_of_prev_token_idx),
                 prev_tokens[:, - (kwargs['max_length'] // 2 - 1) :],
                 tokens
-            ], axis = -1)
+            ], axis = 1)
         
-        output = self.stt_model.infer(inputs, tokens = tokens, training = training, ** kwargs)
+        output = self.compiled_infer(inputs, tokens = tokens, training = training, ** kwargs)
 
         return self.decode_output(output) if decode else output
 
@@ -239,32 +266,44 @@ class Whisper(BaseSTT):
     @timer
     def detect_language(self, audio):
         with time_logger.timer('pre_processing'):
-            mel     = self.get_input(audio, pad_or_trim = True)
-            if len(mel.shape) == 2: mel = ops.expand_dims(mel, axis = 0)
+            mel = self.get_input(audio, pad_or_trim = True)
+            if ops.rank(mel) == 2: mel = ops.expand_dims(mel, axis = 0)
 
             tokens  = ops.fill((mel.shape[0], 1), self.sos_token_idx)
 
-        probs   = self._detect_language(mel = mel, tokens = tokens)
+        probs   = self.compiled_detect_language(mel = mel, tokens = tokens)
+        probs   = ops.convert_to_numpy(probs)
         
         return [(
             self.languages[np.argmax(probs_i)],
             {lang : p for lang, p in zip(self.languages, probs_i)}
-        ) for probs_i in probs.numpy()]
+        ) for probs_i in probs]
 
-    def predict_segment(self, mel, start = 0, end = None, lang = None, verbose = True, condition_on_previous_text = True, ** kwargs):
+    def predict_segment(self,
+                        mel,
+                        start,
+                        end,
+                        *,
+                        
+                        lang    = None,
+                        verbose = True,
+                        condition_on_previous_text = True,
+                        
+                        ** kwargs
+                       ):
+        if end is None: end = self._get_sample_time(len(mel))
+        
         kwargs['verbose'] = verbose
         
         mel = mel[self._get_sample_index(start) : self._get_sample_index(end)]
         
         n_frames    = mel.shape[0]
-        segment_duration = float(
-            self.max_input_length * self.mel_fn.hop_length / self.audio_rate
-        )
+        segment_duration = self._get_sample_time(self.max_input_length)
 
         seek    = 0
         prev_seek   = 0
-        input_stride    = self.max_input_length // self.stt_model.encoder.max_input_length
-        time_precision  = float(input_stride * self.mel_fn.hop_length / self.audio_rate)
+        input_stride    = self.max_input_length // self.model.encoder.max_input_length
+        time_precision  = self._get_sample_time(input_stride)
 
         all_tokens, all_segments = [], []
         with tqdm(total = n_frames, unit = 'frames', disable = verbose != 1) as pbar:
@@ -278,9 +317,9 @@ class Whisper(BaseSTT):
                 result  = self.infer(segment, prev_tokens = prompt, lang = lang, ** kwargs)
 
                 with time_logger.timer('post_processing'):
-                    timestamp_offset = float(seek * self.mel_fn.hop_length / self.audio_rate)
+                    timestamp_offset = self._get_sample_time(seek)
 
-                    tokens  = result.tokens[0].numpy()
+                    tokens  = ops.convert_to_numpy(result.tokens[0])
                     timestamp_tokens    = tokens >= self.timestamp_begin_idx
                     consecutive         = np.where(np.logical_and(
                         timestamp_tokens[:-1], timestamp_tokens[1:]
@@ -304,6 +343,7 @@ class Whisper(BaseSTT):
                                 end     = timestamp_offset + end_timestamp_position * time_precision,
                                 tokens  = sliced_tokens[sliced_tokens < self.eos_token_idx],
                                 result  = result,
+                                lang    = lang,
                                 ** kwargs
                             )
                             last_slice = current_slice
@@ -329,6 +369,7 @@ class Whisper(BaseSTT):
                             end     = timestamp_offset + duration,
                             tokens  = tokens[tokens < self.eos_token_idx],
                             result  = result,
+                            lang    = lang,
                             ** kwargs
                         )
 
@@ -338,7 +379,14 @@ class Whisper(BaseSTT):
                     # update progress bar
                     pbar.update(min(n_frames, seek) - prev_seek)
                     prev_seek = seek
-                    
+        
+        for segment in all_segments:
+            segment.update({
+                'start' : segment['start'] + start,
+                'end'   : min(end, segment['end'] + start)
+            })
+            segment['time'] = segment['end'] - segment['start']
+        
         return all_segments
 
 def timestamp_filter(self, scores, tokens, to_remove, state, max_initial_timestamp = 1, ** _):

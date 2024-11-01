@@ -11,13 +11,13 @@
 
 import os
 
+from utils import import_objects, limit_gpu_memory
 from models.utils import get_model_config
 
-from .base_stt import BaseSTT
-from .jasper import Jasper
-from .deep_speech import DeepSpeech
-from .transformer_stt import TransformerSTT
-from .whisper import Whisper
+globals().update(import_objects(
+    __package__.replace('.', os.path.sep), allow_functions = False
+))
+
 
 def get_model_lang(model):
     return get_model_config(model).get('lang', None)
@@ -34,20 +34,28 @@ def get_model(lang = None, model = None, ** kwargs):
     
     if isinstance(model, str):
         from models import get_pretrained
-        model = get_pretrained(model)
+        
+        model = get_pretrained(model, ** kwargs)
     
     return model
 
 def search(keyword, audios, lang = None, model = None, ** kwargs):
-    model = get_model(lang = lang, model = model)
-    return model.search(keyword, audios, lang = lang, ** kwargs)
+    return get_model(lang = lang, model = model, ** kwargs).search(
+        keyword, audios, lang = lang, ** kwargs
+    )
 
-def predict(audios, lang = None, model = None, ** kwargs):
-    model = get_model(lang = lang, model = model)
-    return model.predict(audios, lang = lang, ** kwargs)
+def transcribe(audios, lang = None, model = None, ** kwargs):
+    return get_model(lang = lang, model = model, ** kwargs).predict(audios, lang = lang, ** kwargs)
+
+def translate(audios, lang = None, model = None, ** kwargs):
+    return get_model(lang = lang, model = model, ** kwargs).predict(
+        audios, lang = lang, task = 'translate', ** kwargs
+    )
+
+def stream(stream, lang = None, model = None, ** kwargs):
+    if 'gpu_memory' in kwargs: limit_gpu_memory(kwargs.pop('gpu_memory'))
+    return get_model(lang = lang, model = model, ** kwargs).stream(stream, lang = lang, ** kwargs)
 
 
-_pretrained = {
-    'en'    : 'pretrained_jasper'
-}
+_pretrained = {}
 

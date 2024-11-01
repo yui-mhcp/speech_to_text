@@ -17,12 +17,14 @@ import pandas as pd
 
 from tqdm import tqdm
 
+from utils import *
+from utils.audio import *
+from utils.callbacks import *
+from models.utils import prepare_prediction_results
 from loggers import timer, time_logger
 from utils.keras_utils import TensorSpec, ops
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_audio_model import BaseAudioModel
-from utils import dump_json, load_json, normalize_filename, pad_batch, get_filename, should_predict
-from utils.audio import write_audio, load_audio, display_audio, AudioAnnotation, AudioSearch, SearchResult
 from utils.text import get_encoder, get_symbols, accent_replacement_matrix, ctc_decode
 
 logger  = logging.getLogger(__name__)
@@ -117,7 +119,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         inp_sign = TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = 'float32')
         
         return inp_sign if not self.is_encoder_decoder else (inp_sign, self.text_signature)
-        
+    
+    @property
+    def infer_signature(self):
+        return TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = 'float32')
+
     @property
     def training_hparams(self):
         return super().training_hparams(
@@ -133,52 +139,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         des += "- Use CTC decoder : {}\n".format(self.use_ctc_decoder)
         return des
     
-    @timer(name = 'prediction', log_if_root = False)
-    def call(self, inputs, training = False, ** kwargs):
-        """
-            Arguments : 
-                - inputs :
-                    if `self.is_encoder_decoder`:
-                        - audio / mel   : [B, seq_in_len, n_channels]
-                        - text          : [B, seq_out_len]
-                    else :
-                        - audio / mel   : [B, seq_len, n_channels]
-            Return :
-                - outputs   : the score for each token at each timestep
-                    if `self.is_encoder_decoder` :
-                        - shape = [B, sub_seq_len, vocab_size]
-                        Note that `sub_seq_len` may differ from `seq_len` (due to subsampling)
-                    else :
-                        - shape = [B, seq_out_len, vocab_size]
-        """
-        if self.stt_model.__class__.__name__ == 'Functional': kwargs = {}
-        return self.stt_model(inputs, training = training, ** kwargs)
-    
     @timer(name = 'inference', log_if_root = False)
     def infer(self, inputs, training = False, decode = False, prev_tokens = None, ** kwargs):
-        if hasattr(self.stt_model, 'infer'):
-            output = self.stt_model.infer(inputs, training = training, ** kwargs)
-        else:
-            output = self(inputs, training = training, ** kwargs)
+        output = self.compiled_infer(inputs, training = training, ** kwargs)
         
         return self.decode_output(output) if decode else output
-    
-    def encode_audio(self, inputs, training = False, ** kwargs):
-        if self.is_encoder_decoder:
-            return self.stt_model.encoder(inputs, training = training, ** kwargs)
-        return self(inputs, training = training, ** kwargs)
-    
-    def decode_audio(self, encoder_output, training = False, return_state = False, ** kwargs):
-        if len(ops.shape(encoder_output)) == 2:
-            encoder_output = ops.expand_dims(encoder_output, axis = 0)
-        
-        if self.use_ctc_decoder:
-            return encoder_output if not return_state else (encoder_output, None)
-
-        return self.stt_model.infer(
-            encoder_output = encoder_output, training = training, return_state = return_state,
-            ** kwargs
-        )
     
     def compile(self, loss = None, metrics = None, loss_config = {}, ** kwargs):
         if loss is None:
@@ -271,31 +236,110 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             kwargs['pad_kwargs']['padded_shapes'] = pad_shapes
         
         return super().get_dataset_config(** kwargs)
-        
-    def predict_with_target(self, batch, epoch = None, step = None, prefix = None, 
-                            directory = None, n_pred = 1):
-        inputs, output = batch
-        inputs = [inp[:n_pred] for inp in inputs]
-        output = [out[:n_pred] for out in output]
-        
-        infer   = None
-        pred    = self.decode_output(self(inputs, training = False))
-        if self.is_encoder_decoder:
-            infer = self.infer(
-                inputs[:-1], early_stopping = False, max_length = ops.shape(output)[1], decode = True
-            )
-        
-        target = self.decode_output(output)
-        
-        des = ""
-        for i in range(len(target)):
-            des = "  Target     : {}\n  Prediction : {}{}\n".format(
-                target[i], pred[i],
-                "" if infer is None else "\n  Inference  : {}".format(infer[i])
-            )
-        logger.info(des)
+    
+    def get_prediction_callbacks(self,
+                                 *,
 
-    def _add_segment(self, all_segments, segment, start, end, tokens, result, ** kwargs):
+                                 save    = True,
+                                 
+                                 directory  = None,
+                                 raw_audio_dir  = None,
+                                 
+                                 filename   = 'audio_{}.mp3',
+                                 # Verbosity config
+                                 verbose = 1,
+                                 
+                                 post_processing    = None,
+                                 
+                                 use_multithreading = False,
+
+                                 ** kwargs
+                                ):
+        """
+            Return a list of `utils.callbacks.Callback` instances that handle data saving/display
+            
+            Arguments :
+                - save  : whether to save detection results
+                          Set to `True` if `save_boxes` or `save_detected` is True
+                - save_empty    : whether to save raw images if no object has been detected
+                - save_detected : whether to save the image with detected objects
+                - save_boxes    : whether to save boxes as individual images (not supported yet)
+                
+                - directory : root directory for saving (see below for the complete tree)
+                - raw_img_dir   : where to save raw images (default `{directory}/images`)
+                - detected_dir  : where to save images with detection (default `{directory}/detected`)
+                - boxes_dir     : where to save individual boxes (not supported yet)
+                
+                - filename  : raw image file format
+                - detected_filename : image with detection file format
+                - boxes_filename    : individual boxes file format
+                
+                - display   : whether to display image with detection
+                              If `None`, set to `True` if `save == False`
+                - verbose   : verbosity level (cumulative, i.e., level 2 includes level 1)
+                              - 1 : displays the image with detection
+                              - 2 : displays the individual boxes
+                              - 3 : logs the boxes position
+                                 
+                - post_processing   : callback function applied on the results
+                                      Takes as input all kwargs returned by `self.predict`
+                                      - image   : the raw original image (`ndarray / Tensor`)
+                                      - boxes   : the detected objects (`dict`)
+                                      * filename    : the image file (`str`)
+                                      * detected    : the image with detection (`ndarray`)
+                                      * output      : raw model output (`Tensor`)
+                                      * frame_index : the frame index in a stream (`int`)
+                                      Entries with "*" are conditionned and are not always provided
+                
+                - use_multithreading    : whether to multi-thread the saving callbacks
+                
+                - kwargs    : mainly ignored
+            Return : (predicted, required_keys, callbacks)
+                - predicted : the mapping `{filename : infos}` stored in `{directory}/map.json`
+                - required_keys : expected keys to save (see `models.utils.should_predict`)
+                - callbacks : the list of `Callback` to be applied on each prediction
+        """
+        if save is None:    save = not verbose
+        if verbose is None: verbose = not save
+        
+        if directory is None: directory = self.pred_dir
+        map_file    = os.path.join(directory, 'map.json')
+        
+        predicted   = {}
+        callbacks   = []
+        required_keys   = ['text']
+        if save:
+            predicted   = load_json(map_file, {})
+            
+            required_keys.append('filename')
+            if raw_audio_dir is None: raw_audio_dir = os.path.join(directory, 'audios')
+            callbacks.append(AudioSaver(
+                key = 'filename',
+                name    = 'saving raw',
+                data_key    = 'audio',
+                file_format = os.path.join(raw_audio_dir, filename),
+                index_key   = 'segment_index',
+                use_multithreading  = use_multithreading
+            ))
+        
+            callbacks.append(JSonSaver(
+                data    = predicted,
+                filename    = map_file,
+                force_keys  = {'alignment'},
+                primary_key = 'filename',
+                use_multithreading = use_multithreading
+            ))
+        
+        if verbose:
+            callbacks.append(AudioDisplayer(show_text = True))
+        
+        if post_processing is not None:
+            callbacks.append(FunctionCallback(post_processing))
+        
+        return predicted, required_keys, callbacks
+
+
+    def _add_segment(self, all_segments, segment, start, end, tokens, result, lang = None, ** kwargs):
         text    = self.decode_output(tokens) if len(tokens) > 0 else ''
         if isinstance(text, list): text = text[0]
         text    = text.strip()
@@ -309,92 +353,90 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             "tokens"    : tokens,
             "score"     : result.score[0].numpy() if hasattr(result, 'score') else 0
         }
+        if lang: infos['lang'] = lang
         if text: all_segments.append(infos)
 
-        return post_process(segment, infos, ** kwargs)
+        return infos
 
     def predict_segment(self, mel, start, end, time_window = 30, ** kwargs):
-        window = self._get_sample_index(time_window)
+        window_sample   = self._get_sample_index(time_window)
+        start_sample    = self._get_sample_index(start)
+        if end:
+            end_sample  = self._get_sample_index(end)
+        else:
+            end, end_sample = self._get_sample_time(len(mel)), len(mel)
         
         segments = []
-        for i, start in enumerate(range(0, len(mel), window)):
+        for i, start in enumerate(range(start_sample, end_sample, window_sample)):
+            segment = mel[start : min(end_sample, start + window_sample)]
             pred = self.infer(
-                ops.expand_dims(mel[start : start + window], axis = 0), decode = False, ** kwargs
+                ops.expand_dims(segment, axis = 0), decode = False, ** kwargs
             )
 
-            self._add_segment(
+            segment_infos = self._add_segment(
                 segments,
-                segment = mel[start : start + window],
-                start   = time_window * i,
-                end     = time_window * (i + 1),
+                segment = segment,
+                start   = start + time_window * i,
+                end     = min(end, start + time_window * (i + 1)),
                 tokens  = pred if not hasattr(pred, 'tokens') else pred.tokens,
                 result  = pred,
                 ** kwargs
             )
+            
+            if part_post_processing is not None:
+                part_post_processing(segment_infos, segment = segment)
         
         return segments
     
     @timer
     def predict(self,
-                filenames,
+                audios,
                 alignments  = None,
+                *,
                 
-                save    = True,
-                directory   = None,
+                verbose = True,
                 overwrite   = False,
-                timestamp   = -1,
-                raw_audio_dir   = None,
-                raw_audio_filename  = 'audio_{}.mp3',
 
                 condition_on_previous_text  = True,
                 
-                post_processing = None,
+                part_post_processing    = None,
                 
-                verbose = False,
+                predicted   = None,
+                _callbacks  = None,
+                required_keys   = None,
+                
                 ** kwargs
                ):
         ####################
         #  Initialization  #
         ####################
         
+        if alignments is not None and not isinstance(alignments, list): alignments = [alignments]
+            
+        now = time.time()
         with time_logger.timer('initialization'):
-            if not isinstance(filenames, (list, tuple, pd.DataFrame)): filenames = [filenames]
-
-            if directory is None: directory = self.pred_dir
-            raw_audio_dir   = os.path.join(directory, 'audios')
-            map_file    = os.path.join(directory, 'map.json')
-
-            predicted = {}
-            if save:
-                os.makedirs(directory, exist_ok = True)
-
-                predicted = load_json(map_file, default = {})
-
-        with time_logger.timer('pre_processing'):
-            results = [None] * len(filenames)
-            duplicatas  = {}
-            requested   = [(
-                get_filename(audio, keys = ('filename', )) if not hasattr(audio, 'filename') else audio.filename,
-                audio
-            ) for audio in filenames]
-
-            inputs = []
-            for i, (file, audio) in enumerate(requested):
-                if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp):
-                    if verbose: logger.info('Audio {} already processed'.format(file))
-                    results[i] = (file, predicted[file])
-                    continue
-
-                if isinstance(file, str):
-                    duplicatas.setdefault(file, []).append(i)
-
-                    if len(duplicatas[file]) > 1:
-                        continue
-
-                inputs.append((i, file, audio))
-
+            join_callbacks = _callbacks is None
+            if _callbacks is None:
+                predicted, required_keys, _callbacks = self.get_prediction_callbacks(
+                    verbose = verbose, ** kwargs
+                )
         
-        for idx, file, data in inputs:
+            results, inputs, indexes, files, duplicates, filtered = prepare_prediction_results(
+                audios,
+                predicted,
+                
+                rank    = 1,
+                primary_key = 'filename',
+                expand_files    = True,
+                normalize_entry = path_to_unix,
+                
+                overwrite   = overwrite,
+                required_keys   = required_keys,
+            )
+        
+        show_idx = apply_callbacks(results, 0, _callbacks)
+        
+        for idx, file, data in zip(indexes, files, inputs):
             if isinstance(file, str) and verbose:
                 logger.info('Processing file {}...'.format(file))
 
@@ -404,54 +446,45 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             # Get associated alignment (if provided)
             alignment = alignments[idx] if alignments is not None else None
             
-            if isinstance(data, AudioAnnotation):
+            if alignments:
+                alignment = alignments[idx]
+            elif isinstance(data, AudioAnnotation):
                 alignment = data._alignment
-            elif isinstance(data, dict):
-                alignment = data.get('alignment', alignment)
-
-            if alignment is None: alignment = [{'id' : -1, 'start' : 0., 'end' : None}]
+            elif isinstance(data, dict) and 'alignment' in data:
+                alignment = data['alignment']
+            else:
+                alignment = [{'id' : -1, 'start' : 0., 'end' : None}]
             
             all_segments = []
             for align in alignment:
                 segments = self.predict_segment(
                     mel,
                     verbose = verbose,
-                    post_processing = post_processing,
+                    part_post_processing    = part_post_processing,
                     ** {** kwargs, ** align}
                 )
                 if isinstance(segments, dict): segments = [segments]
-                for segment in segments:
-                    all_segments.append({** align, ** segment})
-                    all_segments[-1]['start']   += align['start']
-                    all_segments[-1]['end']     += align['start']
+                all_segments.extend([
+                    {** align, ** segment} for segment in segments
+                ])
             
-            infos = {
-                'filename'  : file,
+            infos = {} if not isinstance(data, dict) else data.copy()
+            infos.update({
                 'text'  : ' '.join([seg['text'] for seg in all_segments]),
                 'alignment' : all_segments
-            }
+            })
+            if not isinstance(data, dict):
+                if file: infos['filename'] = file
+                infos['audio'] = data
             
-            if file and file in duplicatas:
-                for idx in duplicatas[file]:
-                    results[idx] = (data, infos)
+            if file:
+                for idx in duplicates[file]:
+                    results[idx] = (predicted.get(file, {}), infos)
             else:
-                results[i] = (data, infos)
+                results[idx] = ({}, infos)
             
-            if save:
-                if not file:
-                    with time_logger.timer('saving audios'):
-                        os.makedirs(raw_audio_dir, exist_ok = True)
-                        file = os.path.join(raw_audio_dir, raw_audio_filename)
-                        if '{}' in file:
-                            file = file.format(len(glob.glob(file.replace('{}', '*'))))
-
-                        write_audio(filename = file, audio = data, rate = self.audio_rate)
-
-                infos['filename']   = file
-                predicted[file]     = infos
-                
-                with time_logger.timer('saving json'):
-                    dump_json(map_file, predicted, indent = 4)
+            show_idx = apply_callbacks(results, show_idx, _callbacks)
+            
         
         return results
     
@@ -509,16 +542,3 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return config
 
-def post_process(segment, infos, post_processing = None, verbose = True, ** kwargs):
-    if verbose == 2:
-        logger.info('Add segment from {} to {} with text {}'.format(
-            infos['start'], infos['end'], infos['text']
-        ))
-
-    if post_processing is not None:
-        try:
-            post_processing(segment, infos, ** kwargs)
-        except Exception as e:
-            logger.error('Exception in `post_processing` : {}'.format(e))
-
-    return infos
