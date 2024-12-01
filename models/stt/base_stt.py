@@ -76,7 +76,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         super().__init__(** kwargs)
         
-        if hasattr(self.stt_model, 'set_tokens'): self.stt_model.set_tokens(** self.model_tokens)
+        if hasattr(self.model, 'set_tokens'): self.model.set_tokens(** self.model_tokens)
 
     def build(self, architecture, stt_model = None, ** kwargs):
         if stt_model is None:
@@ -92,14 +92,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
             }
 
         super(BaseSTT, self).build(stt_model = stt_model)
-            
-    @property
-    def is_encoder_decoder(self):
-        if hasattr(self, 'stt_model'):
-            return getattr(self.stt_model, 'decoder', None) is not None
-        raise NotImplementedError(
-            'You must define `is_encoder_decoder` because it is required before building the model !'
-        )
     
     @property
     def use_ctc_decoder(self):

@@ -23,7 +23,7 @@ from utils.keras_utils import TensorSpec, ops, graph_compile
 from models.stt.base_stt import BaseSTT
 from utils.text.text_encoder import WHISPER_LANGUAGES
 from custom_architectures.transformers_arch import whisper_arch
-from utils.text import remove_tokens, remove_batch_tokens, remove_slice_tokens
+from utils.text import remove_tokens, remove_batch_tokens, remove_slice_tokens, process_model_output
 
 def add_batch_index(indices, batch_size, mask = None):
     if mask is None:
@@ -74,7 +74,7 @@ class Whisper(BaseSTT):
             self.text_encoder[' '], self.eos_token_idx
         ] + t, 'int32')
         
-        self._logits_filter = get_filter(self)
+        #self._logits_filter = get_filter(self)
         self._logits_filter = None
 
     def build(self, pretrained = None, stt_model = None, ** kwargs):
@@ -88,7 +88,7 @@ class Whisper(BaseSTT):
             )
         else:
             super().build(** kwargs)
-
+    
     @property
     def sos_token(self):
         return '<|startoftranscript|>'
@@ -218,16 +218,15 @@ class Whisper(BaseSTT):
               
               ** kwargs
              ):
+        kwargs['encoder_output_lengths']    = 1500
         kwargs.setdefault('max_length',     self.max_output_length)
         kwargs.setdefault('logits_filter',  self._logits_filter)
         
         if ops.rank(inputs) == 2: inputs = ops.expand_dims(inputs, axis = 0)
 
         if tokens is None:
-            if lang is None: lang = [out[0] for out in self.detect_language(inputs)]
-            tokens = ops.convert_to_tensor(
-                self.get_start_tokens(lang = lang, task = task), 'int32'
-            )
+            #if lang is None: lang = [out[0] for out in self.detect_language(inputs)]
+            tokens = self.get_start_tokens(lang = lang, task = task)
         
         if ops.rank(tokens) == 1: tokens = ops.expand_dims(tokens, axis = 0)
         
@@ -235,12 +234,11 @@ class Whisper(BaseSTT):
             tokens = ops.tile(tokens, [len(inputs), 1])
         
         if prev_tokens is not None and len(prev_tokens) > 0 and self.start_of_prev_token_idx != -1:
-            prev_tokens = ops.convert_to_tensor(prev_tokens, 'int32')
             if ops.rank(prev_tokens) == 1:   prev_tokens = ops.expand_dims(prev_tokens, axis = 0)
             elif ops.rank(prev_tokens) == 3: prev_tokens = prev_tokens[:, 0, :]
             
             tokens = ops.concat([
-                ops.fill((len(tokens), 1), self.start_of_prev_token_idx),
+                np.full((len(tokens), 1), self.start_of_prev_token_idx),
                 prev_tokens[:, - (kwargs['max_length'] // 2 - 1) :],
                 tokens
             ], axis = 1)
@@ -287,6 +285,7 @@ class Whisper(BaseSTT):
                         
                         lang    = None,
                         verbose = True,
+                        force_detect_language   = False,
                         condition_on_previous_text = True,
                         
                         ** kwargs
@@ -302,7 +301,7 @@ class Whisper(BaseSTT):
 
         seek    = 0
         prev_seek   = 0
-        input_stride    = self.max_input_length // self.model.encoder.max_input_length
+        input_stride    = 2 # 3000 // 1500
         time_precision  = self._get_sample_time(input_stride)
 
         all_tokens, all_segments = [], []
@@ -313,13 +312,20 @@ class Whisper(BaseSTT):
 
                     segment = self.pad_or_trim(mel[seek :])
 
-                if lang is None: lang = self.detect_language(segment)[0][0]
+                if lang is None and force_detect_language:
+                    lang = self.detect_language(segment)[0][0]
+                
                 result  = self.infer(segment, prev_tokens = prompt, lang = lang, ** kwargs)
+                tokens  = process_model_output(result)[0]
+                if isinstance(tokens, list): tokens = tokens[0]
 
+                if lang is None:
+                    lang    = self._idx_to_lang.get(tokens[0], None)
+                    tokens  = tokens[2:]
+                
                 with time_logger.timer('post_processing'):
                     timestamp_offset = self._get_sample_time(seek)
 
-                    tokens  = ops.convert_to_numpy(result.tokens[0])
                     timestamp_tokens    = tokens >= self.timestamp_begin_idx
                     consecutive         = np.where(np.logical_and(
                         timestamp_tokens[:-1], timestamp_tokens[1:]

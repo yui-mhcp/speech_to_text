@@ -57,10 +57,7 @@ The `Whisper` models are automatically downloaded and converted into the `keras`
 
 ## Installation and usage
 
-1. Clone this repository : `git clone https://github.com/xxxxx/speech_to_text.git`
-2. Go to the root of this repository : `cd speech_to_text`
-3. Install requirements : `pip install -r requirements.txt`
-4. Open `speech_to_text` notebook and follow the instruction !
+Check [this installagion guide](https://github.com/yui-mhcp/yui-mhcp/blob/main/INSTALLATION.md) for the step-by-step instructions !
 
 ## TO-DO list :
 
