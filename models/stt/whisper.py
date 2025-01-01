@@ -48,7 +48,7 @@ class Whisper(BaseSTT):
             kwargs.setdefault('text_encoder',           'whisper')
             kwargs.setdefault('text_encoder_config',    {'multilingual' : lang == 'multi'})
             kwargs.setdefault('mel_fn',                 'WhisperSTFT')
-            kwargs.setdefault('mel_fn_config',          {})
+            kwargs.setdefault('mel_fn_config',          {'n_mel_channels' : 128 if 'large' in pretrained else 80})
             kwargs.setdefault('max_input_length',       3000)
             kwargs.setdefault('use_fixed_length_input', True)
             kwargs.setdefault('pretrained_name',        pretrained)
@@ -299,8 +299,8 @@ class Whisper(BaseSTT):
         n_frames    = mel.shape[0]
         segment_duration = self._get_sample_time(self.max_input_length)
 
-        seek    = 0
-        prev_seek   = 0
+        seek    = kwargs.pop('seek', 0)
+        prev_seek   = seek
         input_stride    = 2 # 3000 // 1500
         time_precision  = self._get_sample_time(input_stride)
 
@@ -385,7 +385,7 @@ class Whisper(BaseSTT):
                     # update progress bar
                     pbar.update(min(n_frames, seek) - prev_seek)
                     prev_seek = seek
-        
+
         for segment in all_segments:
             segment.update({
                 'start' : segment['start'] + start,
