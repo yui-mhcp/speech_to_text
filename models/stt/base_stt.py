@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
-# Licenced under a modified Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2025-now yui-mhcp project author. All rights reserved.
+# Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -20,12 +20,11 @@ from tqdm import tqdm
 from utils import *
 from utils.audio import *
 from utils.callbacks import *
-from models.utils import prepare_prediction_results
-from loggers import timer, time_logger
-from utils.keras_utils import TensorSpec, ops
-from models.interfaces.base_text_model import BaseTextModel
-from models.interfaces.base_audio_model import BaseAudioModel
-from utils.text import get_encoder, get_symbols, accent_replacement_matrix, ctc_decode
+from loggers import Timer, timer
+from utils.keras import TensorSpec, ops
+from ..interfaces.base_text_model import BaseTextModel
+from ..interfaces.base_audio_model import BaseAudioModel
+from utils.text import get_tokenizer, get_symbols
 
 logger  = logging.getLogger(__name__)
 
@@ -47,7 +46,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     
     def __init__(self,
                  lang,
-                 text_encoder   = None,
+                 *,
                  
                  use_fixed_length_input = False,
                  max_input_length   = DEFAULT_MAX_MEL_LENGTH,
@@ -57,17 +56,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                  
                  ** kwargs
                 ):
-        if text_encoder is None:
-            text_encoder = get_encoder(
-                text_encoder = text_encoder,
-                lang    = lang,
-                vocab   = get_symbols(
-                    lang, maj = False, arpabet = False, punctuation = 2
-                ),
-                use_sos_and_eos = self.is_encoder_decoder
-            )
-
-        self._init_text(lang = lang, text_encoder = text_encoder, ** kwargs)
+        self._init_text(lang = lang, ** kwargs)
         self._init_audio(** kwargs)
         
         self.use_fixed_length_input = use_fixed_length_input
@@ -78,9 +67,12 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         if hasattr(self.model, 'set_tokens'): self.model.set_tokens(** self.model_tokens)
 
-    def build(self, architecture, stt_model = None, ** kwargs):
-        if stt_model is None:
-            stt_model = {
+    def build(self, architecture = None, *, model = None, stt_model = None, ** kwargs):
+        if stt_model is not None: model = stt_model
+        elif model is None:
+            assert architecture, 'You must specify the architecture name'
+            
+            model = {
                 'architecture'  : architecture,
                 'input_shape'   : self.mel_input_shape,
                 'vocab_size'    : self.vocab_size,
@@ -91,7 +83,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 ** kwargs
             }
 
-        super(BaseSTT, self).build(stt_model = stt_model)
+        super().build(model = model)
     
     @property
     def use_ctc_decoder(self):
@@ -101,10 +93,6 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     def mel_input_shape(self):
         mel_length = self.max_input_length if self.use_fixed_length_input else None
         return (mel_length, ) + self.audio_signature.shape[2:]
-    
-    @property
-    def decoder_method(self):
-        return 'greedy' if self.is_encoder_decoder else 'beam'
     
     @property
     def input_signature(self):
@@ -118,11 +106,10 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
 
     @property
     def training_hparams(self):
-        return super().training_hparams(
-            ** self.training_hparams_audio,
-            max_input_length    = None,
-            max_output_length   = None
-        )
+        return {
+            ** super().training_hparams,
+            ** self.training_hparams_audio
+        }
     
     def __str__(self):
         des = super().__str__()
@@ -131,11 +118,94 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         des += "- Use CTC decoder : {}\n".format(self.use_ctc_decoder)
         return des
     
-    @timer(name = 'inference', log_if_root = False)
-    def infer(self, inputs, training = False, decode = False, prev_tokens = None, ** kwargs):
-        output = self.compiled_infer(inputs, training = training, ** kwargs)
+    def _infer_segments(self, mel, time_window = 30, segment_processing = None, ** kwargs):
+        window_samples = self._get_sample_index(time_window)
         
-        return self.decode_output(output) if decode else output
+        segments, total_text = [], ''
+        for i, start in enumerate(range(0, len(mel), window_samples)):
+            segment = self.pad_or_trim(mel[start : start + window_samples])
+            
+            tokens = None
+            if self.is_encoder_decoder:
+                tokens = self.get_inference_tokens(prev_text = total_text, ** kwargs)
+            
+            pred    = self.compiled_infer(
+                ops.expand_dims(segment, axis = 0), tokens = tokens, ** kwargs
+            )
+            tokens  = getattr(pred, 'tokens', pred)
+            
+            text    = self.decode_output(pred) if len(pred) > 0 else ''
+            while isinstance(text, list): text = text[0]
+            text    = text.strip()
+            
+            infos = {
+                "start" : start,
+                "end"   : end,
+                "time"  : end - start,
+                "text"  : text,
+                "tokens"    : tokens,
+                "score"     : ops.convert_to_numpy(pred.score[0]) if hasattr(result, 'score') else 0
+            }
+            if lang: infos['lang'] = lang
+            
+            if segment_processing is not None:
+                segment_processing(infos, segment = segment)
+            
+            segments.append(infos)
+            if i > 0: total_text += ' '
+            total_text += text
+        
+        return segments
+
+    @timer(name = 'inference')
+    def infer(self,
+              audio,
+              *,
+              
+              verbose   = False,
+              
+              callbacks = None,
+              predicted = None,
+              overwrite = False,
+              return_output = True,
+              
+              condition_on_previous_text    = True,
+              
+              ** kwargs
+             ):
+        if predicted and not overwrite and isinstance(audio, str) and audio in predicted:
+            if callbacks: apply_callbacks(callbacks, predicted[audio], {}, save = False)
+            return predicted[audio]
+        
+        if isinstance(audio, str) and verbose:
+            logger.info('Processing file {}...'.format(audio))
+
+        infos = audio.copy() if isinstance(audio, dict) else {}
+        
+        with Timer('loading audio'):
+            mel = self.get_input(audio, pad_or_trim = False, ** kwargs)
+        
+        segments = self._infer_segments(
+            mel, verbose = verbose, condition_on_previous_text = condition_on_previous_text, ** kwargs
+        )
+
+        infos.update({
+            'text'      : ' '.join([seg['text'] for seg in segments]),
+            'segments'  : segments
+        })
+        if 'lang' not in infos and segments and 'lang' in segments[0]:
+            infos['lang'] = segments[0]['lang']
+        
+        if not isinstance(audio, dict):
+            if isinstance(audio, str): infos['filename'] = audio
+            else:                      infos['audio'] = audio
+        
+        if callbacks:
+            entry = apply_callbacks(
+                callbacks, {k : v for k, v in infos.items() if k != 'audio'}, infos, save = True
+            )
+        
+        return infos if return_output else {k : v for k, v in infos.items() if k != 'audio'}
     
     def compile(self, loss = None, metrics = None, loss_config = {}, ** kwargs):
         if loss is None:
@@ -149,34 +219,10 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         loss_config['pad_value'] = self.blank_token_idx
         super().compile(loss = loss, metrics = metrics, loss_config = loss_config, ** kwargs)
     
-    def decode_output(self, output, * args, ** kwargs):
+    def decode_output(self, output, ** kwargs):
         if self.use_ctc_decoder:
-            return self.text_encoder.ctc_decode(output, ** kwargs)
+            return self.ctc_decode_text(output, ** kwargs)
         return self.decode_text(output, ** kwargs)
-    
-    @timer
-    def distance(self, hypothesis, truth, ** kwargs):
-        kwargs.setdefault('insertion_cost', {})
-        kwargs.setdefault('deletion_cost', {})
-        kwargs.setdefault('replacement_cost', {})
-        
-        for c in _silent_char + [self.sep_token]:
-            kwargs['insertion_cost'].setdefault(c, 0)
-            kwargs['deletion_cost'].setdefault(c, 0)
-        
-        kwargs['replacement_cost'] = {
-            ** accent_replacement_matrix, ** kwargs['replacement_cost']
-        }
-        
-        return self.text_encoder.distance(hypothesis, truth, ** kwargs)
-    
-    def prepare_input(self, data, pad_or_trim = True):
-        audio = self.get_audio(data)
-        
-        if pad_or_trim:
-            audio = self.pad_or_trim(audio)
-        
-        return audio
     
     def pad_or_trim(self, audio):
         if ops.shape(audio)[0] > self.max_input_length:
@@ -189,6 +235,11 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return audio
     
+    def prepare_input(self, data, pad_or_trim = True, ** kwargs):
+        audio = self.get_audio(data, ** kwargs)
+        
+        return self.pad_or_trim(audio) if pad_or_trim else audio
+
     def prepare_data(self, data):
         mel  = self.prepare_input(data)
         text = self.prepare_output(data)
@@ -229,24 +280,22 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return super().get_dataset_config(** kwargs)
     
-    def get_prediction_callbacks(self,
-                                 *,
+    def get_inference_callbacks(self,
+                                *,
 
-                                 save    = True,
+                                save    = True,
+                                display = None,
+                             
+                                directory   = None,
+                                raw_audio_dir   = None,
+                                filename    = 'audio_{}.mp3',
                                  
-                                 directory  = None,
-                                 raw_audio_dir  = None,
+                                post_processing     = None,
                                  
-                                 filename   = 'audio_{}.mp3',
-                                 # Verbosity config
-                                 verbose = 1,
-                                 
-                                 post_processing    = None,
-                                 
-                                 use_multithreading = False,
+                                save_in_parallel    = False,
 
-                                 ** kwargs
-                                ):
+                                ** kwargs
+                               ):
         """
             Return a list of `utils.callbacks.Callback` instances that handle data saving/display
             
@@ -268,7 +317,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 
                 - display   : whether to display image with detection
                               If `None`, set to `True` if `save == False`
-                - verbose   : verbosity level (cumulative, i.e., level 2 includes level 1)
+                - display   : verbosity level (cumulative, i.e., level 2 includes level 1)
                               - 1 : displays the image with detection
                               - 2 : displays the individual boxes
                               - 3 : logs the boxes position
@@ -291,19 +340,17 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 - required_keys : expected keys to save (see `models.utils.should_predict`)
                 - callbacks : the list of `Callback` to be applied on each prediction
         """
-        if save is None:    save = not verbose
-        if verbose is None: verbose = not save
+        if save is None:    save = not display
+        if display is None: display = not save
         
         if directory is None: directory = self.pred_dir
         map_file    = os.path.join(directory, 'map.json')
         
         predicted   = {}
         callbacks   = []
-        required_keys   = ['text']
         if save:
             predicted   = load_json(map_file, {})
             
-            required_keys.append('filename')
             if raw_audio_dir is None: raw_audio_dir = os.path.join(directory, 'audios')
             callbacks.append(AudioSaver(
                 key = 'filename',
@@ -311,226 +358,50 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 data_key    = 'audio',
                 file_format = os.path.join(raw_audio_dir, filename),
                 index_key   = 'segment_index',
-                use_multithreading  = use_multithreading
+                save_in_parallel  = save_in_parallel
             ))
-        
+            
             callbacks.append(JSonSaver(
                 data    = predicted,
                 filename    = map_file,
-                force_keys  = {'alignment'},
                 primary_key = 'filename',
-                use_multithreading = use_multithreading
+                save_in_parallel = save_in_parallel
             ))
         
-        if verbose:
+        if display:
             callbacks.append(AudioDisplayer(show_text = True))
         
         if post_processing is not None:
-            callbacks.append(FunctionCallback(post_processing))
+            if not isinstance(post_processing, list): post_processing = [post_processing]
+            for fn in post_processing:
+                if callable(fn):
+                    callbacks.append(FunctionCallback(fn))
+                elif hasattr(fn, 'put'):
+                    callbacks.append(QueueCallback(fn))
         
-        return predicted, required_keys, callbacks
+        return predicted, callbacks
 
-
-    def _add_segment(self, all_segments, segment, start, end, tokens, result, lang = None, ** kwargs):
-        text    = self.decode_output(tokens) if len(tokens) > 0 else ''
-        if isinstance(text, list): text = text[0]
-        text    = text.strip()
-
-        infos = {
-            "num"   : len(all_segments),
-            "start" : start,
-            "end"   : end,
-            "time"  : end - start,
-            "text"  : text,
-            "tokens"    : tokens,
-            "score"     : result.score[0].numpy() if hasattr(result, 'score') else 0
-        }
-        if lang: infos['lang'] = lang
-        if text: all_segments.append(infos)
-
-        return infos
-
-    def predict_segment(self, mel, start, end, time_window = 30, ** kwargs):
-        window_sample   = self._get_sample_index(time_window)
-        start_sample    = self._get_sample_index(start)
-        if end:
-            end_sample  = self._get_sample_index(end)
-        else:
-            end, end_sample = self._get_sample_time(len(mel)), len(mel)
-        
-        segments = []
-        for i, start in enumerate(range(start_sample, end_sample, window_sample)):
-            segment = mel[start : min(end_sample, start + window_sample)]
-            pred = self.infer(
-                ops.expand_dims(segment, axis = 0), decode = False, ** kwargs
-            )
-
-            segment_infos = self._add_segment(
-                segments,
-                segment = segment,
-                start   = start + time_window * i,
-                end     = min(end, start + time_window * (i + 1)),
-                tokens  = pred if not hasattr(pred, 'tokens') else pred.tokens,
-                result  = pred,
-                ** kwargs
-            )
-            
-            if part_post_processing is not None:
-                part_post_processing(segment_infos, segment = segment)
-        
-        return segments
-    
     @timer
-    def predict(self,
-                audios,
-                alignments  = None,
-                *,
-                
-                verbose = True,
-                overwrite   = False,
+    def predict(self, inputs, ** kwargs):
+        if (isinstance(inputs, (str, dict))) or (ops.is_array(inputs) and len(inputs.shape) == 1):
+            inputs = [inputs]
+        
+        return super().predict(inputs, ** kwargs)
 
-                condition_on_previous_text  = True,
-                
-                part_post_processing    = None,
-                
-                predicted   = None,
-                _callbacks  = None,
-                required_keys   = None,
-                
-                ** kwargs
-               ):
-        ####################
-        #  Initialization  #
-        ####################
+    def stream(self, stream, ** kwargs):
+        # used to compile the mel-spectrogram to avoid warmup during effective stream
+        for length in (self.rate // 2, self.rate):
+            self.get_input({'audio' : np.zeros((length, ), dtype = 'float32'), 'rate' : self.rate})
         
-        if alignments is not None and not isinstance(alignments, list): alignments = [alignments]
-            
-        now = time.time()
-        with time_logger.timer('initialization'):
-            join_callbacks = _callbacks is None
-            if _callbacks is None:
-                predicted, required_keys, _callbacks = self.get_prediction_callbacks(
-                    verbose = verbose, ** kwargs
-                )
-        
-            results, inputs, indexes, files, duplicates, filtered = prepare_prediction_results(
-                audios,
-                predicted,
-                
-                rank    = 1,
-                primary_key = 'filename',
-                expand_files    = True,
-                normalize_entry = path_to_unix,
-                
-                overwrite   = overwrite,
-                required_keys   = required_keys,
-            )
-        
-        show_idx = apply_callbacks(results, 0, _callbacks)
-        
-        for idx, file, data in zip(indexes, files, inputs):
-            if isinstance(file, str) and verbose:
-                logger.info('Processing file {}...'.format(file))
-
-            with time_logger.timer('loading audio'):
-                mel = self.get_input(data, pad_or_trim = False)
-
-            # Get associated alignment (if provided)
-            alignment = alignments[idx] if alignments is not None else None
-            
-            if alignments:
-                alignment = alignments[idx]
-            elif isinstance(data, AudioAnnotation):
-                alignment = data._alignment
-            elif isinstance(data, dict) and 'alignment' in data:
-                alignment = data['alignment']
-            else:
-                alignment = [{'id' : -1, 'start' : 0., 'end' : None}]
-            
-            all_segments = []
-            for align in alignment:
-                segments = self.predict_segment(
-                    mel,
-                    verbose = verbose,
-                    part_post_processing    = part_post_processing,
-                    ** {** kwargs, ** align}
-                )
-                if isinstance(segments, dict): segments = [segments]
-                all_segments.extend([
-                    {** align, ** segment} for segment in segments
-                ])
-            
-            infos = {} if not isinstance(data, dict) else data.copy()
-            infos.update({
-                'text'  : ' '.join([seg['text'] for seg in all_segments]),
-                'alignment' : all_segments
-            })
-            if not isinstance(data, dict):
-                if file: infos['filename'] = file
-                infos['audio'] = data
-            
-            if file:
-                for idx in duplicates[file]:
-                    results[idx] = (predicted.get(file, {}), infos)
-            else:
-                results[idx] = ({}, infos)
-            
-            show_idx = apply_callbacks(results, show_idx, _callbacks)
-            
-        
-        return results
+        return super().stream(stream, ** kwargs)
     
-    @timer
-    def stream(self, max_time = 30, filename = None, ** kwargs):
-        try:
-            import sounddevice as sd
-        except ImportError as e:
-            logger.error('You must install `sounddevice` : `pip install sounddevice`')
-            return None
-        
-        t0 = time.time()
-        audio = sd.rec(
-            samplerate  = self.audio_rate, 
-            out         = np.zeros((int(self.audio_rate * max_time), 1))
-        )
-        
-        input("Recording... Press enter to stop")
-        sd.stop()
-        t1 = time.time() - t0
-
-        audio = np.reshape(audio, [-1])[2000:int(t1 * self.audio_rate)]
-        audio = audio / np.max(np.abs(audio))
-
-        text = self.infer(self.get_input(audio, pad_or_trim = False), decode = True, ** kwargs)[0]
-        
-        _ = display_audio(audio, rate = self.audio_rate)
-
-        print("\n\nPrediction : {}\n".format(text))
-        
-        if filename is not None:
-            write_audio(audio = audio, filename = filename, rate = self.audio_rate)
-    
-    @timer
-    def search(self, keyword, audios, threshold = 0.8, ** kwargs):
-        # Get predictions for audios
-        pred = self.predict(audios, ** kwargs)
-
-        return SearchResult(* [AudioSearch(
-            keyword = keyword, distance_fn = self.distance, rate = self.audio_rate,
-            directory = self.search_dir, filename = infos['filename'],
-            infos = infos['alignment'], threshold = threshold
-        ) for _, infos in pred])
-    
-    def get_config(self, * args, ** kwargs):
-        config = super().get_config(* args, ** kwargs)    
-        config.update({
+    def get_config(self):
+        return {
+            ** super().get_config(),
             ** self.get_config_audio(),
             ** self.get_config_text(),
-            
+
             'use_fixed_length_input'    : self.use_fixed_length_input,
             'max_input_length'  : self.max_input_length,
             'max_output_length' : self.max_output_length
-        })
-        
-        return config
-
+        }

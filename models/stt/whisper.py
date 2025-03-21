@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
-# Licenced under a modified Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2025-now yui-mhcp project author. All rights reserved.
+# Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -12,82 +12,70 @@
 import os
 import logging
 import numpy as np
-import keras.ops as K
 
 from tqdm import tqdm
 from functools import cached_property
 
-from utils import load_json, dump_json
-from loggers import timer, time_logger
-from utils.keras_utils import TensorSpec, ops, graph_compile
-from models.stt.base_stt import BaseSTT
-from utils.text.text_encoder import WHISPER_LANGUAGES
-from custom_architectures.transformers_arch import whisper_arch
-from utils.text import remove_tokens, remove_batch_tokens, remove_slice_tokens, process_model_output
-
-def add_batch_index(indices, batch_size, mask = None):
-    if mask is None:
-        batch_indexes = ops.range(batch_size)
-    else:
-        indexes = ops.where(mask)
-        indexes = indexes[0] if isinstance(indexes, list) else indexes[:, 0]
-        batch_indexes = ops.cast(indexes, 'int32')
-    
-    return ops.stack([
-        ops.repeat(batch_indexes, ops.shape(indices)[0]),
-        ops.tile(indices, [ops.shape(batch_indexes)[0]])
-    ], axis = 1)
+from .base_stt import BaseSTT
+from loggers import Timer, timer
+from utils.text import process_model_output, mask_tokens, mask_batch_tokens
+from utils.keras import ops, graph_compile
 
 class Whisper(BaseSTT):
     def __init__(self, lang = 'multi', pretrained = 'base', ** kwargs):
         if pretrained:
             self.trim_kwargs = {'normalize' : 32768.}
             
-            lang = 'en' if 'en' in pretrained else 'multi'
-            kwargs['audio_rate'] = 16000
-            kwargs.setdefault('text_encoder',           'whisper')
-            kwargs.setdefault('text_encoder_config',    {'multilingual' : lang == 'multi'})
-            kwargs.setdefault('mel_fn',                 'WhisperSTFT')
-            kwargs.setdefault('mel_fn_config',          {'n_mel_channels' : 128 if 'large' in pretrained else 80})
-            kwargs.setdefault('max_input_length',       3000)
-            kwargs.setdefault('use_fixed_length_input', True)
-            kwargs.setdefault('pretrained_name',        pretrained)
+            kwargs.update({
+                'lang'  : 'en' if 'en' in pretrained else 'multi',
+                'tokenizer' : 'whisper',
+                
+                'rate'  : 16000,
+                'mel_fn'    : 'WhisperSTFT',
+                'mel_config'    : {'n_mel_channels' : 128 if 'large' in pretrained else 80},
+                
+                'max_input_length'  : 3000,
+                'use_fixed_length_input'    : True,
+                
+                'pretrained_name'   : pretrained
+            })
+        else:
+            kwargs['lang'] = lang
         
         kwargs.update({
             'audio_format'  : 'mel',
             'architecture'  : 'Whisper'
         })
-        super().__init__(lang = lang, pretrained = pretrained, ** kwargs)
+        super().__init__(pretrained = pretrained, ** kwargs)
         
         self.trim_kwargs['read_method'] = 'read_ffmpeg'
         
         self._lang_to_idx   = {
             v.strip('<|>') : i for i, v in enumerate(self.vocab)
-            if v.startswith('<|') and v.strip('<|>') in WHISPER_LANGUAGES
+            if v.startswith('<|') and v.strip('<|>') in LANGUAGES
         }
         self._idx_to_lang   = {i : v for v, i in self._lang_to_idx.items()}
         
         t = list(self.non_speech_token_indexes) + list(self.special_token_indexes)
 
-        self.remove_tokens              = ops.cast(t, 'int32')
-        self.remove_tokens_with_space   = ops.cast([
-            self.text_encoder[' '], self.eos_token_idx
+        self.remove_tokens              = np.array(t, 'int32')
+        self.remove_tokens_with_space   = np.array([
+            self.tokenizer[' '], self.eos_token_idx
         ] + t, 'int32')
-        
-        #self._logits_filter = get_filter(self)
-        self._logits_filter = None
 
-    def build(self, pretrained = None, stt_model = None, ** kwargs):
-        if stt_model is not None: return super().build(stt_model = stt_model)
-    
-        if pretrained is not None and 'stt_model' not in kwargs:
-            super(BaseSTT, self).build(
-                stt_model = whisper_arch.Whisper.from_pretrained(
+    def build(self, *, pretrained = None, model = None, stt_model = None, ** kwargs):
+        if stt_model is not None: model = stt_model
+        elif model is None:
+            if pretrained:
+                from architectures.transformers import whisper_arch
+                
+                model = whisper_arch.Whisper.from_pretrained(
                     pretrained = pretrained, decoder_eos_token = self.eos_token_idx, ** kwargs
                 )
-            )
-        else:
-            super().build(** kwargs)
+            else:
+                model = kwargs
+        
+        super().build(model = model)
     
     @property
     def sos_token(self):
@@ -107,7 +95,7 @@ class Whisper(BaseSTT):
     
     @property
     def nospeech_token(self):
-        return '<|nospeech|>' if '<|nospeech|>' in self.text_encoder else '<|nocaptions|>'
+        return '<|nospeech|>' if '<|nospeech|>' in self.tokenizer else '<|nocaptions|>'
     
     @property
     def timestamp_begin_idx(self):
@@ -119,23 +107,23 @@ class Whisper(BaseSTT):
 
     @property
     def sos_token_idx(self):
-        return self.text_encoder[self.sos_token]
+        return self.tokenizer[self.sos_token]
     
     @property
     def transcribe_token_idx(self):
-        return self.text_encoder[self.transcribe_token]
+        return self.tokenizer[self.transcribe_token]
         
     @property
     def translate_token_idx(self):
-        return self.text_encoder[self.translate_token]
+        return self.tokenizer[self.translate_token]
     
     @property
     def start_of_prev_token_idx(self):
-        return self.text_encoder[self.start_of_prev_token]
+        return self.tokenizer[self.start_of_prev_token]
     
     @property
     def nospeech_token_idx(self):
-        return self.text_encoder[self.nospeech_token]
+        return self.tokenizer[self.nospeech_token]
     
     @cached_property
     def language_indexes(self):
@@ -154,9 +142,9 @@ class Whisper(BaseSTT):
         miscellaneous = set("♩♪♫♬♭♮♯")
         assert all(0x2640 <= ord(c) <= 0x267F for c in miscellaneous)
         # allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
-        result = {self.text_encoder[" -"], self.text_encoder[" '"]}
+        result = {self.tokenizer[" -"], self.tokenizer[" '"]}
         for symbol in symbols + list(miscellaneous):
-            for tokens in [self.text_encoder[symbol], self.text_encoder[" " + symbol]]:
+            for tokens in [self.tokenizer[symbol], self.tokenizer[" " + symbol]]:
                 if isinstance(tokens, int):
                     result.add(tokens)
                 elif symbol in miscellaneous and tokens:
@@ -173,157 +161,100 @@ class Whisper(BaseSTT):
 
     @cached_property
     def special_token_indexes(self):
-        return [self.text_encoder[token] for token in self.special_tokens]
-
-    @cached_property
-    def compiled_detect_language(self):
-        mel_signature = self.infer_signature
-        
-        return graph_compile(
-            self._detect_language,
-            prefer_xla  = True,
-            input_signature = [
-                mel_signature,
-                TensorSpec(
-                    shape = (None, mel_signature.shape[1], self.model.hparams.encoder_embedding_dim),
-                    dtype = 'float32'
-                ),
-                TensorSpec(shape = (None, None), dtype = 'int32')
-            ]
-        )
+        return [self.tokenizer[token] for token in self.special_tokens]
     
-    def _detect_language(self, mel = None, encoder_output = None, tokens = None, training = False):
-        if encoder_output is None:
-            encoder_output = self.model.encoder(mel, training = training)
+    @cached_property
+    def segment_duration(self):
+        return self._get_sample_time(self.max_input_length)
+    
+    @cached_property
+    def time_precision(self):
+        return self._get_sample_time(2)
+    
+    @graph_compile(prefer_xla = True)
+    def compiled_detect_language(self, mel, tokens = None, training = False):
+        encoder_output = self.model.encoder(mel, training = training)
+        
+        if tokens is None:
+            tokens = ops.fill((1, 1), self.sos_token_idx)
         
         pred = self.model.decoder(
             tokens, encoder_output = encoder_output, training = training
         )
-        return K.softmax(ops.take_along_axis(
-            pred[:, -1, :], ops.convert_to_tensor(self.language_indexes, 'int32')[:, None], 1
+        return ops.softmax(ops.take(
+            pred[0, -1, :], ops.convert_to_tensor(self.language_indexes, 'int32')
         ), axis = -1)
     
-    @timer(name = 'inference', log_if_root = False)
-    def infer(self,
-              inputs,
-              training  = False,
-              *,
-              
-              lang  = None,
-              task  = None,
-              tokens    = None,
-              prev_tokens   = None,
-              
-              decode    = False,
-              
-              ** kwargs
-             ):
-        kwargs['encoder_output_lengths']    = 1500
-        kwargs.setdefault('max_length',     self.max_output_length)
-        kwargs.setdefault('logits_filter',  self._logits_filter)
-        
-        if ops.rank(inputs) == 2: inputs = ops.expand_dims(inputs, axis = 0)
-
-        if tokens is None:
-            #if lang is None: lang = [out[0] for out in self.detect_language(inputs)]
-            tokens = self.get_start_tokens(lang = lang, task = task)
-        
-        if ops.rank(tokens) == 1: tokens = ops.expand_dims(tokens, axis = 0)
-        
-        if len(tokens) == 1 and len(inputs) > 1:
-            tokens = ops.tile(tokens, [len(inputs), 1])
-        
-        if prev_tokens is not None and len(prev_tokens) > 0 and self.start_of_prev_token_idx != -1:
-            if ops.rank(prev_tokens) == 1:   prev_tokens = ops.expand_dims(prev_tokens, axis = 0)
-            elif ops.rank(prev_tokens) == 3: prev_tokens = prev_tokens[:, 0, :]
-            
-            tokens = ops.concat([
-                np.full((len(tokens), 1), self.start_of_prev_token_idx),
-                prev_tokens[:, - (kwargs['max_length'] // 2 - 1) :],
-                tokens
-            ], axis = 1)
-        
-        output = self.compiled_infer(inputs, tokens = tokens, training = training, ** kwargs)
-
-        return self.decode_output(output) if decode else output
-
-    def get_start_tokens(self, lang = None, task = None):
-        if isinstance(lang, (list, tuple)):
-            if not isinstance(task, (list, tuple)): task = [task] * len(lang)
-            return [self.get_start_tokens(l, t) for l, t in zip(lang, task)]
-        
-        tokens  = [self.sos_token_idx]
-        if lang is None: return tokens
-        
-        tokens.extend([
-            self._lang_to_idx[lang],
-            self.translate_token_idx if task == 'translate' else self.transcribe_token_idx
-        ])
-        return tokens
-    
     @timer
-    def detect_language(self, audio):
-        with time_logger.timer('pre_processing'):
+    def detect_language(self, audio, ** kwargs):
+        with Timer('pre_processing'):
             mel = self.get_input(audio, pad_or_trim = True)
             if ops.rank(mel) == 2: mel = ops.expand_dims(mel, axis = 0)
 
             tokens  = ops.fill((mel.shape[0], 1), self.sos_token_idx)
 
-        probs   = self.compiled_detect_language(mel = mel, tokens = tokens)
+        probs   = self.compiled_detect_language(mel = mel, tokens = tokens, ** kwargs)
         probs   = ops.convert_to_numpy(probs)
         
-        return [(
-            self.languages[np.argmax(probs_i)],
-            {lang : p for lang, p in zip(self.languages, probs_i)}
-        ) for probs_i in probs]
+        return (
+            self.languages[np.argmax(probs)],
+            {lang : p for lang, p in zip(self.languages, probs)}
+        )
 
-    def predict_segment(self,
+    def _infer_segments(self,
                         mel,
-                        start,
-                        end,
                         *,
                         
                         lang    = None,
                         verbose = True,
+                        
                         force_detect_language   = False,
                         condition_on_previous_text = True,
                         
+                        segment_processing  = None,
+                        
                         ** kwargs
                        ):
-        if end is None: end = self._get_sample_time(len(mel))
+        kwargs['encoder_output_lengths']    = 1500
+        kwargs.setdefault('max_length', self.max_output_length)
         
-        kwargs['verbose'] = verbose
-        
-        mel = mel[self._get_sample_index(start) : self._get_sample_index(end)]
-        
-        n_frames    = mel.shape[0]
-        segment_duration = self._get_sample_time(self.max_input_length)
-
         seek    = kwargs.pop('seek', 0)
+        n_frames    = len(mel)        
         prev_seek   = seek
         input_stride    = 2 # 3000 // 1500
-        time_precision  = self._get_sample_time(input_stride)
 
-        all_tokens, all_segments = [], []
-        with tqdm(total = n_frames, unit = 'frames', disable = verbose != 1) as pbar:
+        all_tokens, segments = [], []
+        with tqdm(total = n_frames, unit = 'frames', disable = verbose == 0) as pbar:
             while seek < n_frames:
-                with time_logger.timer('segment processing'):
-                    prompt = all_tokens if condition_on_previous_text else None
+                with Timer('segment processing'):
+                    segment = mel[seek : seek + self.max_input_length]
+                    segment_length = len(segment)
+                    segment = self.pad_or_trim(segment)
 
-                    segment = self.pad_or_trim(mel[seek :])
+                    if lang is None and force_detect_language:
+                        lang, _ = self.detect_language(segment)
 
-                if lang is None and force_detect_language:
-                    lang = self.detect_language(segment)[0][0]
-                
-                result  = self.infer(segment, prev_tokens = prompt, lang = lang, ** kwargs)
-                tokens  = process_model_output(result)[0]
+                    tokens = self.get_inference_tokens(lang = lang, ** kwargs)
+                    if condition_on_previous_text and len(all_tokens):
+                        tokens = np.array(
+                            [self.start_of_prev_token_idx] +
+                            all_tokens[- (kwargs['max_length'] // 2 - 1) :] +
+                            tokens, 'int32'
+                        )
+                    else:
+                        tokens = np.array(tokens, 'int32')
+
+                result = self.compiled_infer(
+                    segment[None], tokens = tokens[None], tokens_length = len(tokens), ** kwargs
+                )
+                tokens = process_model_output(result)[0]
                 if isinstance(tokens, list): tokens = tokens[0]
-
+                
                 if lang is None:
                     lang    = self._idx_to_lang.get(tokens[0], None)
                     tokens  = tokens[2:]
                 
-                with time_logger.timer('post_processing'):
+                with Timer('post_processing'):
                     timestamp_offset = self._get_sample_time(seek)
 
                     timestamp_tokens    = tokens >= self.timestamp_begin_idx
@@ -342,16 +273,18 @@ class Whisper(BaseSTT):
                                 sliced_tokens[-1] - self.timestamp_begin_idx
                             )
                             sliced_tokens = sliced_tokens[1 : -1]
-                            self._add_segment(
-                                all_segments,
-                                segment = segment,
-                                start   = timestamp_offset + start_timestamp_position * time_precision,
-                                end     = timestamp_offset + end_timestamp_position * time_precision,
-                                tokens  = sliced_tokens[sliced_tokens < self.eos_token_idx],
-                                result  = result,
-                                lang    = lang,
-                                ** kwargs
-                            )
+                            
+                            segments.append({
+                                "start" : timestamp_offset + start_timestamp_position * self.time_precision,
+                                "end"   : timestamp_offset + end_timestamp_position * self.time_precision,
+                                "text"  : self.decode_output(sliced_tokens),
+                                "tokens"    : sliced_tokens[sliced_tokens < self.eos_token_idx],
+                                'lang'  : lang
+                            })
+                            
+                            if segment_processing is not None:
+                                segment_processing(segments[-1], segment = segment)
+                            
                             last_slice = current_slice
 
                         last_timestamp_position = (
@@ -360,46 +293,62 @@ class Whisper(BaseSTT):
                         seek += last_timestamp_position * input_stride
                         all_tokens.extend(tokens[: last_slice + 1])
                     else:
-                        duration    = segment_duration
+                        duration    = self._get_sample_time(segment_length)
                         timestamps  = tokens[timestamp_tokens]
                         if len(timestamps) > 0 and timestamps[-1] != self.timestamp_begin_idx:
                             # no consecutive timestamps but it has a timestamp; use the last one.
                             # single timestamp at the end means no speech after the last timestamp.
                             last_timestamp_position = timestamps[-1] - self.timestamp_begin_idx
-                            duration = float(last_timestamp_position) * time_precision
+                            duration = float(last_timestamp_position) * self.time_precision
 
-                        self._add_segment(
-                            all_segments,
-                            segment = segment,
-                            start   = timestamp_offset,
-                            end     = timestamp_offset + duration,
-                            tokens  = tokens[tokens < self.eos_token_idx],
-                            result  = result,
-                            lang    = lang,
-                            ** kwargs
-                        )
+                        segments.append({
+                            "start" : timestamp_offset,
+                            "end"   : timestamp_offset + duration,
+                            "text"  : self.decode_output(tokens),
+                            "tokens"    : tokens[tokens < self.eos_token_idx],
+                            'lang'  : lang
+                        })
+                        
+                        if segment_processing is not None:
+                            segment_processing(segments[-1], segment = segment)
 
-                        seek += segment.shape[0]
+                        seek += len(segment)
                         all_tokens.extend(tokens)
 
                     # update progress bar
                     pbar.update(min(n_frames, seek) - prev_seek)
                     prev_seek = seek
 
-        for segment in all_segments:
-            segment.update({
-                'start' : segment['start'] + start,
-                'end'   : min(end, segment['end'] + start)
-            })
-            segment['time'] = segment['end'] - segment['start']
+        for segment in segments: segment['time'] = segment['end'] - segment['start']
         
-        return all_segments
+        return segments
+
+    def get_inference_tokens(self, lang = None, task = None, ** _):
+        return [
+            self.sos_token_idx,
+            self._lang_to_idx[lang],
+            self.translate_token_idx if task == 'translate' else self.transcribe_token_idx
+        ] if lang else [self.sos_token_idx]
+
+def add_batch_index(indices, batch_size, mask = None):
+    if mask is None:
+        batch_indexes = ops.arange(batch_size)
+    else:
+        indexes = ops.where(mask)
+        indexes = indexes[0] if isinstance(indexes, list) else indexes[:, 0]
+        batch_indexes = ops.convert_to_tensor(indexes, 'int32')
+    
+    indices = ops.convert_to_tensor(indices, 'int32')
+    return ops.stack([
+        ops.repeat(batch_indexes, ops.shape(indices)[0]),
+        ops.tile(indices, [ops.shape(batch_indexes)[0]])
+    ], axis = 1)
 
 def timestamp_filter(self, scores, tokens, to_remove, state, max_initial_timestamp = 1, ** _):
     if state.state is None:
         # suppress generating non-timestamp tokens at the beginning
         to_remove = ops.concat([
-            to_remove, ops.range(self.timestamp_begin_idx)
+            to_remove, ops.arange(self.timestamp_begin_idx)
         ], axis = -1)
 
         # apply the `max_initial_timestamp` option
@@ -408,7 +357,7 @@ def timestamp_filter(self, scores, tokens, to_remove, state, max_initial_timesta
                 to_remove, ops.range(self.timestamp_begin_idx + max_initial_timestamp, ops.shape(scores)[-1])
             ], axis = -1)
 
-        scores = remove_batch_tokens(scores, to_remove)
+        scores = mask_batch_tokens(scores, to_remove)
     else:
         batch_size = ops.shape(scores)[0]
 
@@ -421,44 +370,142 @@ def timestamp_filter(self, scores, tokens, to_remove, state, max_initial_timesta
 
         to_remove_batch = add_batch_index(to_remove, batch_size)
 
-        if ops.reduce_any(last_was_timestamp):
+        if ops.any(last_was_timestamp):
             last_but_not_penultimate    = ops.logical_and(
                 last_was_timestamp, ops.logical_not(penultimate_was_timestamp)
             )
             last_and_penultimate    = ops.logical_and(
                 last_was_timestamp, penultimate_was_timestamp
             )
-            if ops.reduce_any(last_but_not_penultimate):
+            if ops.any(last_but_not_penultimate):
                 to_remove_batch = ops.concat([
                     to_remove_batch,
                     add_batch_index(ops.range(self.eos_token_idx), batch_size, last_but_not_penultimate)
                 ], axis = 0)
 
-            if ops.reduce_any(last_and_penultimate):
+            if ops.any(last_and_penultimate):
                 to_remove_batch = ops.concat([
                     to_remove_batch,
                     add_batch_index(ops.range(self.timestamp_begin_idx, ops.shape(scores)[-1]), batch_size, last_and_penultimate)
                 ], axis = 0)
 
-        scores = remove_tokens(scores, to_remove_batch)
-
+        scores = mask_tokens(scores, to_remove_batch)
         # if sum of probability over timestamps is above any other token, sample timestamp
-        logits  = K.log_softmax(scores)
+        logits  = ops.log_softmax(scores)
 
-        timestamp_logits = K.logsumexp(logits[:, self.timestamp_begin_idx :], axis = -1)
-        max_text_logits  = ops.reduce_max(logits[:, : self.timestamp_begin_idx], axis = -1)
+        timestamp_logits = ops.logsumexp(logits[:, self.timestamp_begin_idx :], axis = -1)
+        max_text_logits  = ops.max(logits[:, : self.timestamp_begin_idx], axis = -1)
 
         timestamp_over_text = timestamp_logits > max_text_logits
-        if ops.reduce_any(timestamp_over_text):
-            scores = remove_tokens(
+        if ops.any(timestamp_over_text):
+            scores = mask_tokens(
                 scores, add_batch_index(ops.range(self.timestamp_begin_idx), batch_size, timestamp_over_text)
             )
 
     return scores
 
-def filter_logits(self, scores, tokens, state, ** _):
+def logits_filter(self, scores, tokens, state, ** _):
     to_remove = self.remove_tokens_with_space if state.state is None else self.remove_tokens
     return timestamp_filter(self, scores, tokens[:, :state.t], to_remove, state)
 
-def get_filter(self):
-    return lambda * args, ** kwargs: filter_logits(self, * args, ** kwargs)
+LANGUAGES = {
+    "en": "english",
+    "zh": "chinese",
+    "de": "german",
+    "es": "spanish",
+    "ru": "russian",
+    "ko": "korean",
+    "fr": "french",
+    "ja": "japanese",
+    "pt": "portuguese",
+    "tr": "turkish",
+    "pl": "polish",
+    "ca": "catalan",
+    "nl": "dutch",
+    "ar": "arabic",
+    "sv": "swedish",
+    "it": "italian",
+    "id": "indonesian",
+    "hi": "hindi",
+    "fi": "finnish",
+    "vi": "vietnamese",
+    "he": "hebrew",
+    "uk": "ukrainian",
+    "el": "greek",
+    "ms": "malay",
+    "cs": "czech",
+    "ro": "romanian",
+    "da": "danish",
+    "hu": "hungarian",
+    "ta": "tamil",
+    "no": "norwegian",
+    "th": "thai",
+    "ur": "urdu",
+    "hr": "croatian",
+    "bg": "bulgarian",
+    "lt": "lithuanian",
+    "la": "latin",
+    "mi": "maori",
+    "ml": "malayalam",
+    "cy": "welsh",
+    "sk": "slovak",
+    "te": "telugu",
+    "fa": "persian",
+    "lv": "latvian",
+    "bn": "bengali",
+    "sr": "serbian",
+    "az": "azerbaijani",
+    "sl": "slovenian",
+    "kn": "kannada",
+    "et": "estonian",
+    "mk": "macedonian",
+    "br": "breton",
+    "eu": "basque",
+    "is": "icelandic",
+    "hy": "armenian",
+    "ne": "nepali",
+    "mn": "mongolian",
+    "bs": "bosnian",
+    "kk": "kazakh",
+    "sq": "albanian",
+    "sw": "swahili",
+    "gl": "galician",
+    "mr": "marathi",
+    "pa": "punjabi",
+    "si": "sinhala",
+    "km": "khmer",
+    "sn": "shona",
+    "yo": "yoruba",
+    "so": "somali",
+    "af": "afrikaans",
+    "oc": "occitan",
+    "ka": "georgian",
+    "be": "belarusian",
+    "tg": "tajik",
+    "sd": "sindhi",
+    "gu": "gujarati",
+    "am": "amharic",
+    "yi": "yiddish",
+    "lo": "lao",
+    "uz": "uzbek",
+    "fo": "faroese",
+    "ht": "haitian creole",
+    "ps": "pashto",
+    "tk": "turkmen",
+    "nn": "nynorsk",
+    "mt": "maltese",
+    "sa": "sanskrit",
+    "lb": "luxembourgish",
+    "my": "myanmar",
+    "bo": "tibetan",
+    "tl": "tagalog",
+    "mg": "malagasy",
+    "as": "assamese",
+    "tt": "tatar",
+    "haw": "hawaiian",
+    "ln": "lingala",
+    "ha": "hausa",
+    "ba": "bashkir",
+    "jw": "javanese",
+    "su": "sundanese",
+}
