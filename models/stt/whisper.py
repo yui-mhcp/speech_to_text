@@ -244,11 +244,16 @@ class Whisper(BaseSTT):
                     else:
                         tokens = np.array(tokens, 'int32')
 
-                result = self.compiled_infer(
+                tokens = self.compiled_infer(
                     segment[None], tokens = tokens[None], tokens_length = len(tokens), ** kwargs
                 )
-                tokens = process_model_output(result)[0]
-                if isinstance(tokens, list): tokens = tokens[0]
+                if hasattr(tokens, 'tokens'):
+                    tokens = process_model_output(tokens)[0]
+                else:
+                    tokens = tokens[0]
+                if tokens and isinstance(tokens[0], list):
+                    tokens = tokens[0]
+                tokens = np.array(tokens, dtype = np.int32)
                 
                 if lang is None:
                     lang    = self._idx_to_lang.get(tokens[0], None)
