@@ -251,6 +251,7 @@ class Whisper(BaseSTT):
                     tokens = process_model_output(tokens)[0]
                 else:
                     tokens = tokens[0]
+                
                 if tokens and isinstance(tokens[0], list):
                     tokens = tokens[0]
                 tokens = np.array(tokens, dtype = np.int32)
@@ -306,11 +307,12 @@ class Whisper(BaseSTT):
                             last_timestamp_position = timestamps[-1] - self.timestamp_begin_idx
                             duration = float(last_timestamp_position) * self.time_precision
 
+                        tokens = tokens[tokens < self.eos_token_idx]
                         segments.append({
                             "start" : timestamp_offset,
                             "end"   : timestamp_offset + duration,
                             "text"  : self.decode_output(tokens),
-                            "tokens"    : tokens[tokens < self.eos_token_idx],
+                            "tokens"    : tokens,
                             'lang'  : lang
                         })
                         
