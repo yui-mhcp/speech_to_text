@@ -9,17 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import importlib
-
 from utils import setup_environment
-from ..interfaces import BaseModel
+from utils.generic_utils import import_submodules
+from ..core import BaseModel
 
 _models = {}
-for module in os.listdir(__package__.replace('.', os.path.sep)):
-    if module.startswith(('.', '_')) or '_old' in module: continue
-    module = importlib.import_module(__package__ + '.' + module[:-3])
-    
+for module in import_submodules(__package__):
     _models.update({
         k : v for k, v in vars(module).items() if isinstance(v, type) and issubclass(v, BaseModel)
     })
@@ -27,7 +22,7 @@ globals().update(_models)
 
 def get_model_name(lang):
     if lang not in _pretrained:
-        raise ValueError('Unknown language for pretrained TTS model\n  Accepted : {}\n  Got : {}'.format(tuple(_pretrained.keys()), lang))
+        raise ValueError('Unknown language for pretrained STT model\n  Accepted : {}\n  Got : {}'.format(tuple(_pretrained.keys()), lang))
     return _pretrained[lang]
 
 def get_model(lang = None, model = None):
@@ -55,4 +50,3 @@ def stream(stream, *, lang = None, model = None, ** kwargs):
     return get_model(lang = lang, model = model).stream(stream, lang = lang, ** kwargs)
 
 _pretrained = {}
-

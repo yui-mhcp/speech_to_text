@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this project in your work, please cite it as below."
+title: "speech_to_text: a Speech-To-Text toolkit built on the BaseModel interface (Whisper + TensorRT-LLM)"
+abstract: >-
+  Speech-To-Text (STT) toolkit built on the `BaseModel` interface, providing a
+  keras implementation of `Whisper`, transcription / search utilities and
+  TensorRT-LLM accelerated inference — part of the yui-mhcp projects.
+authors:
+  - name: "yui"
+    email: "yui-mhcp@tutanota.com"
+type: software
+version: 1.0.0
+date-released: 2026-07-21
+license: AGPL-3.0-or-later
+url: "https://github.com/yui-mhcp"
+repository-code: "https://github.com/yui-mhcp/speech_to_text"
+keywords:
+  - deep-learning
+  - keras
+  - speech-to-text
+  - whisper
+  - asr
+  - audio
+  - tensorrt

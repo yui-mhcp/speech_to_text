@@ -22,8 +22,7 @@ from utils.audio import *
 from utils.callbacks import *
 from loggers import Timer, timer
 from utils.keras import TensorSpec, ops
-from ..interfaces.base_text_model import BaseTextModel
-from ..interfaces.base_audio_model import BaseAudioModel
+from ..core import BaseModel, TextModelMixin, AudioModelMixin
 from utils.text import get_tokenizer, get_symbols
 
 logger  = logging.getLogger(__name__)
@@ -36,13 +35,13 @@ MIN_AUDIO_TIME  = 0.1
 DEFAULT_MAX_MEL_LENGTH  = 1024
 DEFAULT_MAX_TEXT_LENGTH = min(256, DEFAULT_MAX_MEL_LENGTH // 2)
         
-class BaseSTT(BaseTextModel, BaseAudioModel):
+class BaseSTT(TextModelMixin, AudioModelMixin, BaseModel):
     _directories    = {
-        ** BaseTextModel._directories, 'search_dir' : '{root}/{self.name}/search'
+        ** BaseModel._directories, 'search_dir' : '{root}/{self.name}/search'
     }
-    
-    output_signature    = BaseTextModel.text_signature
-    prepare_output  = BaseTextModel.encode_text
+
+    output_signature    = TextModelMixin.text_signature
+    prepare_output  = TextModelMixin.encode_text
     
     def __init__(self,
                  lang,
@@ -96,21 +95,14 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     
     @property
     def input_signature(self):
-        inp_sign = TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = 'float32')
-        
+        inp_sign = TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = self.audio_dtype)
+
         return inp_sign if not self.is_encoder_decoder else (inp_sign, self.text_signature)
-    
-    @property
-    def infer_signature(self):
-        return TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = 'float32')
 
     @property
-    def training_hparams(self):
-        return {
-            ** super().training_hparams,
-            ** self.training_hparams_audio
-        }
-    
+    def infer_signature(self):
+        return TensorSpec(shape = (None, ) + self.mel_input_shape, dtype = self.audio_dtype)
+
     def __str__(self):
         des = super().__str__()
         des += self._str_text()
@@ -121,30 +113,34 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
     def _infer_segments(self, mel, time_window = 30, segment_processing = None, ** kwargs):
         window_samples = self._get_sample_index(time_window)
         
+        lang = kwargs.get('lang', None)
         segments, total_text = [], ''
         for i, start in enumerate(range(0, len(mel), window_samples)):
+            end     = min(start + window_samples, len(mel))
             segment = self.pad_or_trim(mel[start : start + window_samples])
-            
+
             tokens = None
             if self.is_encoder_decoder:
                 tokens = self.get_inference_tokens(prev_text = total_text, ** kwargs)
-            
+
             pred    = self.compiled_infer(
                 ops.expand_dims(segment, axis = 0), tokens = tokens, ** kwargs
             )
             tokens  = getattr(pred, 'tokens', pred)
-            
+
             text    = self.decode_output(pred) if len(pred) > 0 else ''
             while isinstance(text, list): text = text[0]
             text    = text.strip()
-            
+
+            # start / end are in samples (or mel frames) : convert them to seconds
+            # for consistency with `Whisper._infer_segments`
             infos = {
-                "start" : start,
-                "end"   : end,
-                "time"  : end - start,
+                "start" : self._get_sample_time(start),
+                "end"   : self._get_sample_time(end),
+                "time"  : self._get_sample_time(end - start),
                 "text"  : text,
                 "tokens"    : tokens,
-                "score"     : ops.convert_to_numpy(pred.score[0]) if hasattr(result, 'score') else 0
+                "score"     : ops.convert_to_numpy(pred.score[0]) if hasattr(pred, 'score') else 0
             }
             if lang: infos['lang'] = lang
             
@@ -174,9 +170,10 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
               ** kwargs
              ):
         if predicted and not overwrite and isinstance(audio, str) and audio in predicted:
-            if callbacks: apply_callbacks(callbacks, predicted[audio], {}, save = False)
-            return predicted[audio]
-        
+            return self._finalize_cached_prediction(
+                audio, callbacks = callbacks, predicted = predicted
+            )
+
         if isinstance(audio, str) and verbose:
             logger.info('Processing file {}...'.format(audio))
 
@@ -199,14 +196,14 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         if not isinstance(audio, dict):
             if isinstance(audio, str): infos['filename'] = audio
             else:                      infos['audio'] = audio
-        
-        if callbacks:
-            entry = apply_callbacks(
-                callbacks, {k : v for k, v in infos.items() if k != 'audio'}, infos, save = True
-            )
-        
-        return infos if return_output else {k : v for k, v in infos.items() if k != 'audio'}
-    
+
+        return self._finalize_predictions(
+            infos, callbacks = callbacks, predicted = predicted, return_output = return_output
+        )
+
+    def filter_prediction_output(self, output):
+        return {k : v for k, v in output.items() if k != 'audio'}
+
     def compile(self, loss = None, metrics = None, loss_config = {}, ** kwargs):
         if loss is None:
             loss = 'TextLoss' if self.is_encoder_decoder else 'CTCLoss'
@@ -245,9 +242,9 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         text = self.prepare_output(data)
         
         if not self.is_encoder_decoder: return mel, text
-        
-        text_in, text_out = text_in[:-1], text_out[1:]
-        
+
+        text_in, text_out = text[:-1], text[1:]
+
         return (mel, text_in), text_out
     
     def filter_data(self, inputs, output):
@@ -337,7 +334,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 - kwargs    : mainly ignored
             Return : (predicted, required_keys, callbacks)
                 - predicted : the mapping `{filename : infos}` stored in `{directory}/map.json`
-                - required_keys : expected keys to save (see `models.utils.should_predict`)
+                - required_keys : expected keys to save (see `models.core.utils.should_predict`)
                 - callbacks : the list of `Callback` to be applied on each prediction
         """
         if save is None:    save = not display
@@ -361,7 +358,7 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
                 save_in_parallel  = save_in_parallel
             ))
             
-            callbacks.append(JSonSaver(
+            callbacks.append(JSONSaver(
                 data    = predicted,
                 filename    = map_file,
                 primary_key = 'filename',
@@ -381,12 +378,9 @@ class BaseSTT(BaseTextModel, BaseAudioModel):
         
         return predicted, callbacks
 
-    @timer
-    def predict(self, inputs, ** kwargs):
-        if (isinstance(inputs, (str, dict))) or (ops.is_array(inputs) and len(inputs.shape) == 1):
-            inputs = [inputs]
-        
-        return super().predict(inputs, ** kwargs)
+    def _normalize_prediction_inputs(self, inputs):
+        if ops.is_array(inputs) and len(inputs.shape) == 1: return [inputs]
+        return super()._normalize_prediction_inputs(inputs)
 
     def stream(self, stream, ** kwargs):
         # used to compile the mel-spectrogram to avoid warmup during effective stream

@@ -1,34 +1,52 @@
 # :yum: Speech To Text (STT)
 
+![Python](https://img.shields.io/badge/python-3.12-blue.svg)
+![License](https://img.shields.io/badge/licence-AGPL--3.0-green.svg)
+![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+
+This repository provides an easy-to-use `Speech-To-Text (STT)` API built on top of the `BaseModel` interface, featuring a `keras` implementation of `Whisper`, transcription / word-search utilities and optional `TensorRT-LLM` accelerated inference.
+
 Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications! :yum:
 
 ## Project structure
 
 ```bash
 ├── architectures            : utilities for model architectures
-│   ├── layers               : custom layer implementations
-│   ├── transformers         : transformer architecture implementations
-│   │   └── whisper_arch.py     : Whisper architecture
-│   ├── generation_utils.py  : utilities for text and sequence generation
-│   ├── hparams.py           : hyperparameter management
-│   └── simple_models.py     : defines classical models such as CNN / RNN / MLP and siamese
-├── custom_train_objects     : custom objects used in training / testing
-├── loggers                  : logging utilities for tracking experiment progress
+│   ├── layers                   : custom layer implementations
+│   ├── transformers             : transformer architecture implementations
+│   │   ├── *_arch.py                : concrete transformer models (bart, bert, gpt2, mistral, t5, whisper, ...)
+│   │   ├── text_transformer_arch.py : base blocks for text-based Transformers
+│   │   └── transformer_arch.py      : generic Transformer blocks
+│   ├── current_blocks.py        : defines common blocks (e.g., Conv + BN + ReLU)
+│   ├── generation_utils.py      : utilities for text and sequence generation
+│   ├── hparams.py               : hyperparameter management
+│   └── simple_models.py         : defines classical models such as CNN / RNN / MLP and siamese
+├── custom_train_objects     : custom objects used in training / testing (callbacks, losses, metrics, optimizers, ...)*
+├── docker                   : docker-compose files and Dockerfiles for containerized runs
+├── loggers                  : custom utilities for the `logging` module*
 ├── models                   : main directory for model classes
-│   ├── interfaces           : directories for interface classes
-│   ├── stt                  : STT implementations
-│   │   ├── base_stt.py      : abstract base class for all STT models
-│   │   └── whisper.py       : Whisper implementation
-│   └── weights_converter.py : utilities to convert weights between different models
-├── tests                    : unit and integration tests for model validation
-├── utils                    : utility functions for data processing and visualization
-├── LICENCE                  : project license file
-├── README.md                : this file
-├── requirements.txt         : required packages
-└── speech_to_text.ipynb     : notebook demonstrating model creation + STT features
+│   ├── core                     : the `BaseModel` foundation (mixins + saving / migration utils)*
+│   ├── stt                      : Speech-To-Text implementations
+│   │   ├── base_stt.py              : abstract base class for all STT models (`BaseSTT`)
+│   │   └── whisper.py               : Whisper `keras` implementation
+│   └── weights_converter.py     : utilities to convert weights between different models
+├── pretrained_models        : pretrained / converted checkpoints (e.g. TensorRT-LLM Whisper engines)
+├── tests                    : `pytest` suite mirroring the `utils` / `loggers` and model tree*
+├── utils                    : shared data-processing / keras utilities*
+├── audio_en.wav                : example audio file used by the notebook
+├── convert_checkpoint-0.18.py  : HuggingFace -> TensorRT-LLM checkpoint conversion (TRT-LLM 0.18 API)
+├── convert_checkpoint-0.19.py  : HuggingFace -> TensorRT-LLM checkpoint conversion (TRT-LLM 0.19 API)
+├── speech_to_text.ipynb        : notebook demonstrating model creation + STT features
+├── CHANGELOG.md                : project-specific changelog
+├── CITATION.cff                : citation metadata
+├── CONTRIBUTING.md             : contribution guidelines
+├── INSTALLATION.md             : shared GPU environment installation guide
+├── LICENCE                     : project license file
+├── pyproject.toml              : project metadata, dependencies and tooling config
+└── README.md                   : this file
 ```
 
-Check [the main project](https://github.com/yui-mhcp/base_dl_project) for more information about the unextended modules / structure / main classes.
+\* The `loggers`, `utils`, `custom_train_objects`, `models/core` and most of the `tests` tree are the shared foundation maintained in the [base_dl_project](https://github.com/yui-mhcp/base_dl_project) and [data_processing](https://github.com/yui-mhcp/data_processing) repositories — check them for more information on these modules / main classes.
 
 ## Available features
 
@@ -45,24 +63,72 @@ The `speech_to_text` notebook provides a concrete demonstration of the `stt` and
 
 ### Model architectures
 
-Available architectures: 
+Available architectures:
 - [Whisper](https://github.com/openai/whisper): OpenAI's Whisper multilingual STT model with transformer architecture
-
-### Model weights
-
-The `Whisper` models are automatically downloaded and converted from the `transformers` library.
 
 ## Installation and usage
 
-See [the installation guide](https://github.com/yui-mhcp/blob/master/INSTALLATION.md) for a step-by-step installation :smile:
+See [the installation guide](INSTALLATION.md) for a step-by-step setup of the shared GPU environment (NVIDIA driver, CUDA, `mamba` and the deep-learning backends) :smile:
 
-Here is a summary of the installation procedure, if you have a working python environment :
-1. Clone this repository: `git clone https://github.com/xxxxx/speech_to_text.git`
-2. Go to the root of this repository: `cd speech_to_text`
-3. Install requirements: `pip install -r requirements.txt`
-4. Open the `speech_to_text` notebook and follow the instructions!
+Here is a summary of the installation procedure, once your python environment is ready :
+1. Clone this repository : `git clone https://github.com/yui-mhcp/speech_to_text.git`
+2. Go to the root of this repository : `cd speech_to_text`
+3. Install the package with a backend : `pip install -e .[tf]` (or `pip install -e .[torch]`)
+4. Open the `speech_to_text` notebook and follow the instructions !
 
-**Important Note** : The `TensorRT-LLM` support for `Whisper` is currently limited to the version `0.15.0` of the library, requiring a `python 3.10` environment. See the installation guide mentionned above for a step-by-step installation ;)
+Like the [base_dl_project](https://github.com/yui-mhcp/base_dl_project), this project trains / runs real models, so it needs a **keras backend**. The audio, text and `transformers` dependencies (required by every STT model) are installed by default — you only pick the backend extra matching your setup :
+
+```bash
+pip install -e .[tf]         # keras + tensorflow (+ torch for checkpoint conversion)
+pip install -e .[torch]      # keras + torch
+pip install -e .[keras]      # alias of [tf]
+
+# optional helpers :
+pip install -e .[image]      # cv2 / pillow-based utilities (utils/image)
+pip install -e .[datasets]   # utils/datasets (tensorflow-datasets, pandas)
+pip install -e .[dev]        # test tooling (pytest & plugins)
+
+# extras can be combined :
+pip install -e .[tf,image,datasets]
+```
+
+The backend is selected at runtime through the `KERAS_BACKEND` environment variable (e.g., `os.environ['KERAS_BACKEND'] = 'tensorflow'`), as shown at the top of the notebook.
+
+**Important Note** : converting the official `Whisper` checkpoints (pytorch → keras) requires `torch`, which is why it is pulled by the `[tf]` extra as well. For **accelerated inference**, the [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) support for `Whisper` targets `tensorrt_llm < 1.3` on a `python 3.12` environment ; it is installed separately from the NVIDIA package index — see the [installation guide](INSTALLATION.md) (which also notes the `1.2.1` int8 caveat on Blackwell) and the `convert_checkpoint-0.*.py` helper scripts. ;)
+
+### Quickstart
+
+```python
+import os
+os.environ['KERAS_BACKEND'] = 'tensorflow'
+
+from models.stt import Whisper
+
+# 1. Build a pretrained Whisper model (downloaded / converted from `transformers`)
+model = Whisper(pretrained = 'openai/whisper-base', lang = 'multi', nom = 'whisper-base')
+print(model)
+
+# 2. Transcribe an audio / video file
+result = model.predict('audio_en.wav')
+```
+
+See the `speech_to_text.ipynb` notebook for the full walkthrough (model building and transcription). :smile:
+
+### Testing
+
+The tests use [`pytest`](https://docs.pytest.org/) and live in the `tests/` directory, mirroring the `utils` / `loggers` and model tree.
+
+```bash
+pip install -e .[dev]        # pytest, pytest-cov, pytest-xdist, pytest-timeout
+
+pytest                       # run the whole suite
+pytest -n auto               # run in parallel (pytest-xdist)
+pytest -m "not slow"         # skip the slow / heavy tests
+pytest --cov                 # run with coverage report
+pytest tests/models          # run a single subpackage
+```
+
+Tests are annotated with markers (declared in `pyproject.toml`) so the suite adapts to your environment : the `tensorflow`, `torch`, `keras`, `cv2` and `gpu` markers are **auto-skipped** when the corresponding dependency (or hardware) is missing, meaning you can run the tests for the backend you installed without pulling every dependency.
 
 ## TO-DO list:
 
@@ -70,7 +136,7 @@ Here is a summary of the installation procedure, if you have a working python en
 - [x] Comment the code
 - [x] Add multilingual model support (`Whisper`)
 - [x] Add Beam-Search text decoding
-- [ ] Add streaming support 
+- [ ] Add streaming support
 - [x] Convert `Whisper` pretrained models from the `transformers` hub
 - [x] Support [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) for inference
 
@@ -168,7 +234,7 @@ Contacts:
 - **Mail**: `yui-mhcp@tutanota.com`
 - **[Discord](https://discord.com)**: yui0732
 
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the [LICENCE](LICENCE) file for details.
 
 This license allows you to use, modify, and distribute the code, as long as you include the original copyright and license notice in any copy of the software/source. Additionally, if you modify the code and distribute it, or run it on a server as a service, you must make your modified version available under the same license.
 
@@ -179,7 +245,7 @@ For more information about the AGPL-3.0 license, please visit [the official webs
 If you find this project useful in your work, please add this citation to give it more visibility! :yum:
 
 ```
-@misc{yui-mhcp
+@misc{yui-mhcp,
     author  = {yui},
     title   = {A Deep Learning projects centralization},
     year    = {2021},
