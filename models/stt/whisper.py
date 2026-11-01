@@ -19,21 +19,46 @@ from functools import cached_property
 
 from .base_stt import BaseSTT
 from loggers import Timer, timer
+from utils import load_json, resolve_hf_snapshot
 from utils.text import process_model_output, mask_tokens, mask_batch_tokens
 from utils.keras import ops, graph_compile
 
 logger  = logging.getLogger(__name__)
 
+def _get_n_mels(pretrained):
+    """
+        Number of mel channels of the `pretrained` checkpoint : the `num_mel_bins` of its
+        `config.json` (HF repository or local directory), `80` for an official `openai` short name
+    """
+    if '/' not in pretrained and not os.path.exists(pretrained):
+        return 80   # the official checkpoints (`WHISPER_MODELS`) all have 80 mel channels
+    
+    config_file = os.path.join(resolve_hf_snapshot(pretrained), 'config.json')
+    if not os.path.exists(config_file):
+        # a repository not cached yet : its config alone is enough
+        from huggingface_hub import hf_hub_download
+        
+        config_file = hf_hub_download(pretrained, 'config.json')
+    
+    return load_json(config_file)['num_mel_bins']
+
+
 class Whisper(BaseSTT):
     def __init__(self, lang = 'multi', pretrained = 'openai/whisper-base', ** kwargs):
         if pretrained:
+            # an official `openai` short name (e.g., `base`) has its tokenizer in `openai/whisper-<name>`
+            tokenizer = pretrained
+            if '/' not in pretrained and not os.path.exists(pretrained):
+                tokenizer = 'openai/whisper-{}'.format(pretrained.removeprefix('whisper-'))
+            
             kwargs.update({
-                'lang'  : 'en' if 'en' in pretrained else 'multi',
-                'tokenizer' : pretrained,
+                # only the `*.en` checkpoints are english-only
+                'lang'  : 'en' if pretrained.endswith('.en') else 'multi',
+                'tokenizer' : tokenizer,
                 
                 'rate'  : 16000,
                 'mel_fn'    : 'WhisperSTFT',
-                'mel_config'    : {'n_mel_channels' : 128 if 'large' in pretrained else 80},
+                'mel_config'    : {'n_mel_channels' : _get_n_mels(pretrained)},
                 'load_audio_kwargs' : {
                     'normalize'     : 32768.,
                     'read_method'   : 'read_ffmpeg'
@@ -196,6 +221,13 @@ class Whisper(BaseSTT):
 
         return audio
 
+    def prepare_input(self, data, pad_or_trim = True, ** kwargs):
+        if self.runtime == 'trt_llm_api':
+            # the LLM API engine computes the log-mel itself (on GPU) from the raw audio, which
+            # it zero-pads to the window : `_infer_segments` then cuts the audio, not the mel
+            return self.get_audio_input(data, ** kwargs)
+        return super().prepare_input(data, pad_or_trim = pad_or_trim, ** kwargs)
+
     @graph_compile(prefer_xla = True)
     def compiled_detect_language(self, mel, tokens = None, training = False):
         encoder_output = self.model.encoder(mel, training = training)
@@ -252,8 +284,17 @@ class Whisper(BaseSTT):
         # (which otherwise defaults to 1 in `CustomModelRunnerCpp.generate` !)
         kwargs.setdefault('max_new_tokens', kwargs['max_length'])
 
+        # `mel` is the raw audio with the LLM API (see `prepare_input`) : `seek` stays counted in
+        # mel frames, and each window is cut from the audio at its sample position
+        is_audio    = self.runtime == 'trt_llm_api'
+        if is_audio and condition_on_previous_text:
+            # the LLM API whisper input processor requires the decoder prompt to start with
+            # `<|startoftranscript|>`, i.e. rejects the `<|startofprev|>` prefix
+            logger.debug('`condition_on_previous_text` is not supported by the LLM API runtime')
+            condition_on_previous_text = False
+
         seek    = kwargs.pop('seek', 0)
-        n_frames    = len(mel)
+        n_frames    = self.mel_fn.get_mel_length(len(mel)) if is_audio else len(mel)
         prev_seek   = seek
         input_stride    = 2 # 3000 // 1500
 
@@ -263,9 +304,16 @@ class Whisper(BaseSTT):
         with tqdm(total = n_frames, unit = 'frames', disable = verbose == 0) as pbar:
             while seek < n_frames:
                 with Timer('segment processing'):
-                    segment = mel[seek : seek + self.max_input_length]
-                    segment_length = len(segment)
-                    segment = self.pad_or_trim(segment)
+                    if is_audio:
+                        segment = mel[
+                            self.mel_fn.get_audio_length(seek) :
+                            self.mel_fn.get_audio_length(seek + self.max_input_length)
+                        ]
+                        segment_length = min(n_frames - seek, self.max_input_length)
+                    else:
+                        segment = mel[seek : seek + self.max_input_length]
+                        segment_length = len(segment)
+                        segment = self.pad_or_trim(segment)
 
                     if lang is None and force_detect_language:
                         lang, _ = self.detect_language(segment)
@@ -315,7 +363,7 @@ class Whisper(BaseSTT):
                 else:
                     tokens = tokens[0]
                 
-                if tokens and isinstance(tokens[0], list):
+                if len(tokens) and isinstance(tokens[0], list):
                     tokens = tokens[0]
                 tokens = np.array(tokens, dtype = np.int32)
 

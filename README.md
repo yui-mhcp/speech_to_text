@@ -2,11 +2,11 @@
 
 ![Python](https://img.shields.io/badge/python-3.12-blue.svg)
 ![License](https://img.shields.io/badge/licence-AGPL--3.0-green.svg)
-![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)
 
-This repository provides an easy-to-use `Speech-To-Text (STT)` API built on top of the `BaseModel` interface, featuring a `keras` implementation of `Whisper`, transcription / word-search utilities and optional `TensorRT-LLM` accelerated inference.
+This repository provides an easy-to-use `Speech-To-Text (STT)` API built on top of the `BaseModel` interface, featuring a `keras` implementation of `Whisper`, transcription / edit-distance utilities and optional `TensorRT-LLM` accelerated inference (through its `LLM API`).
 
-Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications! :yum:
+Check the [CHANGELOG](CHANGELOG.md) file for the latest updates of this project, and the [global CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) for a cross-project overview ! :yum:
 
 ## Project structure
 
@@ -30,12 +30,10 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 │   │   ├── base_stt.py              : abstract base class for all STT models (`BaseSTT`)
 │   │   └── whisper.py               : Whisper `keras` implementation
 │   └── weights_converter.py     : utilities to convert weights between different models
-├── pretrained_models        : pretrained / converted checkpoints (e.g. TensorRT-LLM Whisper engines)
+├── pretrained_models        : pretrained / converted model checkpoints and configurations
 ├── tests                    : `pytest` suite mirroring the `utils` / `loggers` and model tree*
 ├── utils                    : shared data-processing / keras utilities*
 ├── audio_en.wav                : example audio file used by the notebook
-├── convert_checkpoint-0.18.py  : HuggingFace -> TensorRT-LLM checkpoint conversion (TRT-LLM 0.18 API)
-├── convert_checkpoint-0.19.py  : HuggingFace -> TensorRT-LLM checkpoint conversion (TRT-LLM 0.19 API)
 ├── speech_to_text.ipynb        : notebook demonstrating model creation + STT features
 ├── CHANGELOG.md                : project-specific changelog
 ├── CITATION.cff                : citation metadata
@@ -43,7 +41,8 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 ├── INSTALLATION.md             : shared GPU environment installation guide
 ├── LICENCE                     : project license file
 ├── pyproject.toml              : project metadata, dependencies and tooling config
-└── README.md                   : this file
+├── README.md                   : this file
+└── __version__.py              : single-source project version
 ```
 
 \* The `loggers`, `utils`, `custom_train_objects`, `models/core` and most of the `tests` tree are the shared foundation maintained in the [base_dl_project](https://github.com/yui-mhcp/base_dl_project) and [data_processing](https://github.com/yui-mhcp/data_processing) repositories — check them for more information on these modules / main classes.
@@ -54,10 +53,10 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 
 | Feature   | Function / class   | Description |
 | :-------- | :---------------- | :---------- |
-| Speech-To-Text    | `stt`             | Perform `STT` on audio / video files      |
-| Search            | `search`          | Search for words in audio / video and display timestamps |
+| Speech-To-Text    | `transcribe`      | Perform `STT` on audio / video files      |
+| Translation       | `translate`       | Translate audio / video files into english text (`Whisper` translation task) |
 
-The `speech_to_text` notebook provides a concrete demonstration of the `stt` and `search` functions.
+The `speech_to_text` notebook provides a concrete demonstration of the `transcribe` function, and of the partial alignment used for keyword search.
 
 ## Available models
 
@@ -94,7 +93,9 @@ pip install -e .[tf,image,datasets]
 
 The backend is selected at runtime through the `KERAS_BACKEND` environment variable (e.g., `os.environ['KERAS_BACKEND'] = 'tensorflow'`), as shown at the top of the notebook.
 
-**Important Note** : converting the official `Whisper` checkpoints (pytorch → keras) requires `torch`, which is why it is pulled by the `[tf]` extra as well. For **accelerated inference**, the [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) support for `Whisper` targets `tensorrt_llm < 1.3` on a `python 3.12` environment ; it is installed separately from the NVIDIA package index — see the [installation guide](INSTALLATION.md) (which also notes the `1.2.1` int8 caveat on Blackwell) and the `convert_checkpoint-0.*.py` helper scripts. ;)
+**Important Note** : converting the official `Whisper` checkpoints (pytorch → keras) requires `torch`, which is why it is pulled by the `[tf]` extra as well. For **accelerated inference**, the [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) support for `Whisper` relies on its `LLM API` (`runtime = 'trt_llm_api'`, `tensorrt_llm >= 1.3`), which directly loads the `transformers` checkpoint : there is no engine to build anymore ! The library is installed separately from the NVIDIA package index — see the [installation guide](INSTALLATION.md) and the notebook. ;)
+
+**Known limitation** : the `LLM API` Whisper input processor requires the decoder prompt to start with `<|startoftranscript|>`, so `condition_on_previous_text` is not supported by the `trt_llm_api` runtime (it is silently disabled).
 
 ### Quickstart
 
@@ -138,11 +139,11 @@ Tests are annotated with markers (declared in `pyproject.toml`) so the suite ada
 - [x] Add Beam-Search text decoding
 - [ ] Add streaming support
 - [x] Convert `Whisper` pretrained models from the `transformers` hub
-- [x] Support [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) for inference
+- [x] Support [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) for inference (through the `LLM API`)
 
-## Search and partial alignment
+## Keyword search with partial alignment
 
-Even though `Whisper` produces high-quality transcriptions, it can still make mistakes, making exact-match searches ineffective. To address this limitation, the proposed `search` method leverages the `Edit` distance to compute a similarity score between the search text and the produced transcription. This allows matches to be defined based on a tolerance threshold rather than exact matching!
+Even though `Whisper` produces high-quality transcriptions, it can still make mistakes, making exact-match searches ineffective. To address this limitation, the `utils.text.edit_distance` function (with `partial = True`) computes the `Edit` distance between the search text and its best-aligned span in the produced transcription. This allows matches to be defined based on a tolerance threshold rather than exact matching!
 
 For instance, searching *cat* in *the ct is on the chair* will not find an exact match for *cat*, while *ct* has only 1 mismatch (the missing *a*).
 
@@ -164,7 +165,7 @@ The value at index **i, j** is the minimum between:
 
 Note: To simplify the examples, all costs have been set to 1, but they can be specified in the `edit_distance` function (e.g., punctuation may have a cost of 0).
 
-The objective is to align *cat* at all positions of the transcript (*the ct is*). For this purpose, the solution sets the 1st line to 0, allowing alignment at each position without penalizing the position of the alignment:
+The objective is to align *cat* at all positions of the transcript (*the ct is*). For this purpose, the partial alignment (`partial = True`) sets the 1st line to 0, allowing alignment at each position without penalizing the position of the alignment:
 
 |   |   | t | h | e |   | c | t |   | i | s |
 |:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
@@ -175,7 +176,7 @@ The objective is to align *cat* at all positions of the transcript (*the ct is*)
 
 Note: Scores will be more relevant for longer search terms, as they're less influenced by small variations.
 
-An example is provided in the `speech_to_text` notebook to better illustrate how the search works.
+An example is provided in the `speech_to_text` notebook (*Edit distance demonstration*) to better illustrate how the partial alignment works.
 
 ## Notes and references
 
